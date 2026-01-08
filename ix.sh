@@ -4,9 +4,9 @@
 #  配置参数区域  #
 #===============#
 
-TARGET_IP="103.177.163.128"
+TARGET_IP="10.22.1.112"
 PORT_START=23
-PORT_END=65000
+PORT_END=65535
 
 # 获取本机出口 IP
 LOCAL_IP=$(ip route get 1 | awk '{print $7; exit}')
