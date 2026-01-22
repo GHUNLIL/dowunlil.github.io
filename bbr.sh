@@ -1,5 +1,5 @@
 #!/bin/bash
-# 一键 sysctl 配置（适配 Debian 13 及旧版本兼容）
+# 一键 sysctl 配置家宽服务器不丢ipv6版
 
 SYSCTL_FILE="/etc/sysctl.d/50-bbr.conf"
 BBR_MODULE_FILE="/etc/modules-load.d/bbr.conf"
