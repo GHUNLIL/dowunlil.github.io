@@ -1,18 +1,39 @@
 #!/bin/bash
 # ============================================================
-# 专线网络优化工具 beta1.0
+# 专线网络优化工具 v2.0
 # 链路拓扑: 用户 → 前置 → IX专线 → 国际转发 → 落地 → 家宽
-# 功能: BBR/sysctl优化 + TC双向限速 + 链路向导
+# 功能: BBR/sysctl优化 + 链路向导 + 国家白名单 + 端口监控
 # 用法:
 #   交互式: sudo bash network-optimizer.sh
 #   直接操作: sudo bash network-optimizer.sh <命令>
 # ============================================================
+# 融合说明:
+#   - 来自 beta1.0: 完整4类向导交互、GeoIP完整功能
+#                    (自定义IP/forward链/ping切换/并行下载)、端口监控3视图
+#                    冲突检测刷新、完整服务管理
+#   - 来自 beta1.3: 基于实际内存的tcp_mem计算、BDP×2对齐MB的缓冲区算法
+#                    内存评估+自动Swap、3档连接参数(≤10/≤1000/>1000)
+#                    run_cmd工具函数、VERSION变量
+# ============================================================
 
-IFB_DEV="ifb0"
+VERSION="v2.0"
+
 CONFIG_DIR="/etc/network-optimizer"
 SYSCTL_CONF="$CONFIG_DIR/sysctl-optimize.conf"
-TC_CONF="$CONFIG_DIR/tc-shaping.conf"
 PROFILE_CONF="$CONFIG_DIR/profile.conf"
+
+# 国家白名单配置
+GEO_CONF="$CONFIG_DIR/geo-whitelist.conf"
+GEO_DIR="$CONFIG_DIR/geo-zones"
+GEO_NFT="$CONFIG_DIR/geo-nftables.nft"
+GEO_IP_SOURCE="https://www.ipdeny.com/ipblocks/data/aggregated"
+
+declare -A COUNTRY_NAMES=(
+    [cn]="中国" [hk]="香港" [tw]="台湾" [jp]="日本" [kr]="韩国"
+    [sg]="新加坡" [us]="美国" [gb]="英国" [de]="德国" [fr]="法国"
+    [au]="澳大利亚" [ca]="加拿大" [ru]="俄罗斯" [th]="泰国" [my]="马来西亚"
+    [vn]="越南" [id]="印尼" [ph]="菲律宾" [in]="印度" [nl]="荷兰"
+)
 
 # ==================== 权限检查 ====================
 if [ "$(id -u)" -ne 0 ]; then
@@ -38,6 +59,14 @@ WHITE='\033[1;37m'
 DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
+
+# ==================== 通用工具函数 ====================
+run_cmd() {
+    local msg="$1"
+    shift
+    echo -ne "  ${WHITE}${msg} ... ${NC}"
+    "$@" && echo -e "${GREEN}✓${NC}" || { echo -e "${RED}✗${NC}"; return 1; }
+}
 
 init_config_dir() { mkdir -p "$CONFIG_DIR"; }
 
@@ -119,25 +148,51 @@ read_int() {
 }
 
 # ================================================================
-#                      链路拓扑定义
-# ================================================================
-#
-# 完整链路:
-#   用户电脑 ──→ 前置服务器 ──→ IX专线服务器 ──→ 国际转发服务器 ──→ 落地服务器 ──→ 家宽/网站
-#
-# 每个节点的特征:
-#   前置服务器: 面向用户接入，可能是带宽瓶颈（小水管）
-#   IX专线服务器: 专线核心，大带宽中转，无NAT
-#   国际转发/直接线路服务器: 跨国中继/直连线路，可能有翻墙需求
-#   落地服务器: 最终出口，访问目标网站/游戏，可能有翻墙需求
-#
-
-# ================================================================
-#                    BDP计算与参数生成
+#                    内存评估 (来自 beta1.3)
 # ================================================================
 
-# 根据带宽和RTT计算最优sysctl参数
-# 参数: $1=角色名 $2=上游带宽Mbps $3=上游RTT(ms) $4=下游带宽Mbps $5=下游RTT(ms) $6=额外header信息
+check_memory_and_swap() {
+    echo ""
+    echo -e "  ${BOLD}${CYAN}━━━ 内存评估 ━━━${NC}"
+    local total_mem_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+    [ -z "$total_mem_kb" ] && total_mem_kb=2097152
+    local total_swap_kb=$(grep SwapTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+    [ -z "$total_swap_kb" ] && total_swap_kb=0
+    local total_avail_kb=$(( total_mem_kb + total_swap_kb ))
+
+    echo -e "  ${WHITE}物理内存:    ${BOLD}$(( total_mem_kb / 1024 ))MB${NC}"
+    [ $total_swap_kb -gt 0 ] && echo -e "  ${WHITE}Swap:        ${BOLD}$(( total_swap_kb / 1024 ))MB${NC}" || echo -e "  ${DIM}Swap:        未配置${NC}"
+    echo -e "  ${WHITE}总可用:      ${BOLD}$(( total_avail_kb / 1024 ))MB${NC}"
+    echo ""
+
+    if [ $(( total_avail_kb / 1024 )) -lt 1024 ]; then
+        echo -e "  ${YELLOW}⚠ 内存较小，建议创建Swap${NC}"
+        if confirm_action "是否自动创建2GB Swap?"; then
+            local swap_file="/swapfile"
+            if [ ! -f "$swap_file" ]; then
+                run_cmd "创建Swap文件" fallocate -l 2G "$swap_file" || dd if=/dev/zero of="$swap_file" bs=1M count=2048 status=none
+                chmod 600 "$swap_file"
+                mkswap "$swap_file" >/dev/null 2>&1
+                swapon "$swap_file" >/dev/null 2>&1
+                grep -q "$swap_file" /etc/fstab || echo "$swap_file none swap sw 0 0" >> /etc/fstab
+                echo -e "  ${GREEN}✓ Swap已创建并启用${NC}"
+            else
+                echo -e "  ${DIM}Swap文件已存在${NC}"
+            fi
+        fi
+    else
+        echo -e "  ${GREEN}✓ 内存充足${NC}"
+    fi
+}
+
+# ================================================================
+#                    BDP计算与参数生成 (融合算法)
+# ================================================================
+# 缓冲区: 来自beta1.3 — def固定512KB, max=BDP×2对齐MB(≥1MB)
+# tcp_mem: 来自beta1.3 — 基于实际内存计算
+# 连接参数: 来自beta1.3 — 3档(≤10/≤1000/>1000)
+# 其余sysctl参数: 来自beta1.0 — 完整分类注释
+
 calculate_and_generate() {
     local role_name="$1"
     local up_bw="$2" up_rtt="$3"
@@ -150,48 +205,71 @@ calculate_and_generate() {
     local bdp_main=$bdp_up
     [ $bdp_down -gt $bdp_main ] && bdp_main=$bdp_down
 
-    # 瓶颈带宽 (取两个方向的较小带宽)
+    # 瓶颈带宽与最大带宽
     local bottleneck=$up_bw
     [ $down_bw -lt $bottleneck ] && bottleneck=$down_bw
+    local max_bw=$up_bw
+    [ $down_bw -gt $max_bw ] && max_bw=$down_bw
 
-    # default = BDP向上取整到64KB边界，至少128KB
-    local def_val=$(( (bdp_main / 65536 + 1) * 65536 ))
-    [ $def_val -lt 131072 ] && def_val=131072
-
-    # max = default * 8，至少1MB，最大16MB
-    local max_val=$(( def_val * 8 ))
+    # 缓冲区 (来自beta1.3: 固定default 512KB, max=BDP×2对齐到MB)
+    local def_val=524288
+    local max_val=$(( bdp_main * 2 ))
+    max_val=$(( (max_val + 1048575) / 1048576 * 1048576 ))
     [ $max_val -lt 1048576 ] && max_val=1048576
-    [ $max_val -gt 16777216 ] && max_val=16777216
 
-    # tcp_mem档位
-    local tcp_mem
-    if [ $max_val -le 2097152 ]; then
-        tcp_mem="65536 98304 131072"
-    elif [ $max_val -le 8388608 ]; then
-        tcp_mem="98304 131072 196608"
-    else
-        tcp_mem="131072 196608 262144"
-    fi
+    # tcp_mem (来自beta1.3: 基于实际内存计算)
+    local total_mem_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+    [ -z "$total_mem_kb" ] && total_mem_kb=2097152
+    local total_swap_kb=$(grep SwapTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+    [ -z "$total_swap_kb" ] && total_swap_kb=0
+    local total_avail_kb=$(( total_mem_kb + total_swap_kb ))
 
-    # notsent_lowat: 瓶颈<=10M用16KB，否则32KB
+    local est_concurrent=50
+    local per_conn_kb=$(( max_val * 2 / 1024 ))
+    local net_need_kb=$(( est_concurrent * per_conn_kb ))
+    local sys_overhead_kb=307200
+    local total_need_kb=$(( net_need_kb + sys_overhead_kb ))
+
+    local total_avail_pages=$(( total_avail_kb / 4 ))
+    local mem_low=$(( total_avail_pages * 3 / 100 ))
+    local mem_pressure=$(( total_avail_pages * 6 / 100 ))
+    local mem_high=$(( total_avail_pages * 10 / 100 ))
+    local min_high_pages=$(( net_need_kb / 4 ))
+    [ $mem_high -lt $min_high_pages ] && mem_high=$min_high_pages
+    [ $mem_pressure -lt $(( mem_high * 6 / 10 )) ] && mem_pressure=$(( mem_high * 6 / 10 ))
+    [ $mem_low -lt $(( mem_high * 3 / 10 )) ] && mem_low=$(( mem_high * 3 / 10 ))
+    [ $mem_low -lt 65536 ] && mem_low=65536
+    [ $mem_pressure -lt 98304 ] && mem_pressure=98304
+    [ $mem_high -lt 131072 ] && mem_high=131072
+    local tcp_mem="$mem_low $mem_pressure $mem_high"
+
+    # notsent_lowat
     local notsent_lowat=32768
     [ $bottleneck -le 10 ] && notsent_lowat=16384
 
-    # 连接队列参数
-    local somaxconn=65535 syn_backlog=16384 netdev_backlog=16384
-    local tw_buckets=2000000 max_orphans=65536 file_max=1048576
-    if [ $bottleneck -le 10 ]; then
+    # 连接队列参数 (来自beta1.3: 3档)
+    local somaxconn syn_backlog netdev_backlog tw_buckets max_orphans file_max
+    if [ $max_bw -le 10 ]; then
         somaxconn=32768; syn_backlog=8192; netdev_backlog=8192
         tw_buckets=1000000; max_orphans=32768; file_max=524288
+    elif [ $max_bw -le 1000 ]; then
+        somaxconn=65535; syn_backlog=16384; netdev_backlog=16384
+        tw_buckets=2000000; max_orphans=65536; file_max=1048576
+    else
+        somaxconn=65535; syn_backlog=32768; netdev_backlog=65536
+        tw_buckets=4000000; max_orphans=131072; file_max=2097152
     fi
 
-    # UDP参数
-    local udp_rmem=65536 udp_wmem=65536 udp_mem="65536 131072 262144"
-    if [ $bottleneck -le 10 ]; then
+    # UDP参数 (来自beta1.3: 3档)
+    local udp_rmem udp_wmem udp_mem
+    if [ $max_bw -le 10 ]; then
         udp_rmem=32768; udp_wmem=32768; udp_mem="32768 65536 131072"
+    elif [ $max_bw -le 1000 ]; then
+        udp_rmem=65536; udp_wmem=65536; udp_mem="65536 131072 262144"
+    else
+        udp_rmem=262144; udp_wmem=262144; udp_mem="262144 524888 1048576"
     fi
 
-    # fin_timeout
     local fin_timeout=15
     [ $bottleneck -le 10 ] && fin_timeout=20
 
@@ -201,9 +279,10 @@ calculate_and_generate() {
 ${extra_header}
 # 主BDP方向: ${up_bw}Mbps × ${up_rtt}ms RTT = $(( bdp_up / 1024 ))KB
 # 次BDP方向: ${down_bw}Mbps × ${down_rtt}ms RTT = $(( bdp_down / 1024 ))KB
-# 缓冲区: default=$(( def_val / 1024 ))KB / max=$(( max_val / 1024 / 1024 ))MB
+# 缓冲区: default=512KB / max=$(( max_val / 1048576 ))MB
+# tcp_mem: ${tcp_mem} (基于系统内存 $(( total_mem_kb / 1024 ))MB 计算)
 # 系统: Ubuntu/Debian
-# 生成工具: 专线网络优化工具 beta1.0
+# 生成工具: 专线网络优化工具 $VERSION
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
 # ============================================================
 
@@ -290,7 +369,7 @@ EOF
 }
 
 # ================================================================
-#                      应用 sysctl
+#                      应用 sysctl (融合)
 # ================================================================
 
 apply_sysctl_config() {
@@ -309,9 +388,11 @@ apply_sysctl_config() {
         fi
     fi
 
+    # 内存评估 (来自beta1.3)
+    check_memory_and_swap
+
     init_config_dir
     echo "$config_content" > "$SYSCTL_CONF"
-
     echo "SYSCTL_PROFILE_NAME=\"$role_name\"" > "$PROFILE_CONF"
 
     # 备份
@@ -340,162 +421,7 @@ apply_sysctl_config() {
 }
 
 # ================================================================
-#                       TC 限速
-# ================================================================
-
-select_interface() {
-    local detected=$(detect_interface)
-    local ifaces=() labels=()
-
-    while IFS= read -r line; do
-        local name=$(echo "$line" | awk -F': ' '{print $2}')
-        [[ "$name" =~ ^(lo|ifb|veth|docker|br-) ]] && continue
-        local addr=$(ip -4 addr show "$name" 2>/dev/null | awk '/inet / {print $2; exit}')
-        [ -z "$addr" ] && addr="无IPv4"
-        ifaces+=("$name")
-        [ "$name" = "$detected" ] && labels+=("$name ($addr) ← 默认路由") || labels+=("$name ($addr)")
-    done < <(ip -o link show up)
-
-    if [ ${#ifaces[@]} -eq 0 ]; then
-        echo -e "${RED}[错误] 未找到可用网卡${NC}"; exit 1
-    fi
-    if [ ${#ifaces[@]} -eq 1 ]; then
-        TC_IFACE="${ifaces[0]}"
-        echo -e "  ${GREEN}检测到网卡: ${WHITE}${BOLD}$TC_IFACE${NC}"
-        return
-    fi
-
-    select_menu "选择要限速的网卡" "${labels[@]}"
-    TC_IFACE="${ifaces[$?]}"
-}
-
-tc_calculate() {
-    local bw="$1" margin="$2"
-    local rate_kbit=$(( bw * (100 - margin) * 10 ))
-    local rate_int=$(( rate_kbit / 1000 ))
-    local rate_dec=$(( (rate_kbit % 1000) / 100 ))
-
-    local burst_kb=256 latency="10ms"
-    if [ "$bw" -le 10 ]; then
-        burst_kb=16; latency="20ms"
-    elif [ "$bw" -le 100 ]; then
-        burst_kb=64; latency="15ms"
-    fi
-
-    TC_RATE="${rate_kbit}kbit"
-    TC_BURST="${burst_kb}kb"
-    TC_LATENCY="$latency"
-    TC_DESC="${bw}Mbps → 限速${rate_int}.${rate_dec}Mbps (余量${margin}%)"
-}
-
-apply_tc_shaping() {
-    echo ""
-    echo -e "  ${BOLD}${CYAN}应用限速: $TC_DESC${NC}"
-    echo -e "  ${WHITE}网卡: $TC_IFACE | 速率: $TC_RATE | 突发: $TC_BURST | 排队: $TC_LATENCY${NC}"
-    echo ""
-
-    tc qdisc del dev "$TC_IFACE" root 2>/dev/null
-    tc qdisc del dev "$TC_IFACE" ingress 2>/dev/null
-    tc qdisc del dev "$IFB_DEV" root 2>/dev/null
-    ip link set "$IFB_DEV" down 2>/dev/null
-
-    echo -ne "  [出方向] tbf + fq ... "
-    tc qdisc add dev "$TC_IFACE" root handle 1: tbf rate $TC_RATE burst $TC_BURST latency $TC_LATENCY && \
-    tc qdisc add dev "$TC_IFACE" parent 1:1 handle 10: fq && echo -e "${GREEN}✓${NC}" || { echo -e "${RED}✗${NC}"; return 1; }
-
-    echo -ne "  [入方向] ifb 模块 ... "
-    modprobe ifb numifbs=1 2>/dev/null; ip link set "$IFB_DEV" up 2>/dev/null && echo -e "${GREEN}✓${NC}" || { echo -e "${RED}✗${NC}"; return 1; }
-
-    echo -ne "  [入方向] 流量镜像 ... "
-    tc qdisc add dev "$TC_IFACE" handle ffff: ingress && \
-    tc filter add dev "$TC_IFACE" parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev "$IFB_DEV" && \
-    echo -e "${GREEN}✓${NC}" || { echo -e "${RED}✗${NC}"; return 1; }
-
-    echo -ne "  [入方向] tbf + fq ... "
-    tc qdisc add dev "$IFB_DEV" root handle 1: tbf rate $TC_RATE burst $TC_BURST latency $TC_LATENCY && \
-    tc qdisc add dev "$IFB_DEV" parent 1:1 handle 10: fq && echo -e "${GREEN}✓${NC}" || { echo -e "${RED}✗${NC}"; return 1; }
-
-    init_config_dir
-    cat > "$TC_CONF" << EOF
-TC_RATE="$TC_RATE"
-TC_BURST="$TC_BURST"
-TC_LATENCY="$TC_LATENCY"
-TC_IFACE="$TC_IFACE"
-TC_DESC="$TC_DESC"
-EOF
-
-    echo ""
-    echo -e "  ${GREEN}${BOLD}限速已生效: $TC_IFACE 双向 $TC_RATE${NC}"
-    echo ""
-}
-
-stop_tc() {
-    local iface
-    if [ -f "$TC_CONF" ]; then source "$TC_CONF"; iface="$TC_IFACE"; else iface=$(detect_interface); fi
-    echo -e "  ${YELLOW}清除 $iface 限速规则...${NC}"
-    tc qdisc del dev "$iface" root 2>/dev/null
-    tc qdisc del dev "$iface" ingress 2>/dev/null
-    tc qdisc del dev "$IFB_DEV" root 2>/dev/null
-    ip link set "$IFB_DEV" down 2>/dev/null
-    modprobe -r ifb 2>/dev/null
-    echo -e "  ${GREEN}已清除${NC}"
-}
-
-
-tc_menu() {
-    while true; do
-    echo ""
-
-    # 当前状态
-    local iface=$(detect_interface)
-    if [ -n "$iface" ] && tc qdisc show dev "$iface" 2>/dev/null | grep -q tbf; then
-        [ -f "$TC_CONF" ] && source "$TC_CONF"
-        echo -e "  ${GREEN}●${NC} 当前限速: ${WHITE}${TC_DESC:-已启用}${NC}"
-    else
-        echo -e "  ${DIM}○ 当前限速: 未启用${NC}"
-    fi
-    echo ""
-
-    select_menu "TC流量限速" \
-        "配置限速 (输入带宽自动计算)" \
-        "停止限速" \
-        "返回主菜单"
-
-    case $? in
-        0) tc_setup ;;
-        1) stop_tc ;;
-        2) return ;;
-    esac
-
-    echo ""
-    echo -ne "  ${DIM}按回车继续...${NC}"
-    read -r
-    done
-}
-
-tc_setup() {
-    echo ""
-    tput cnorm 2>/dev/null
-    stty sane 2>/dev/null
-
-    local bw
-    read_int "线路带宽 (Mbps)" "" "bw"
-
-    select_menu "限速余量" \
-        "5%  (线路非常稳定)" \
-        "8%  (推荐)" \
-        "10% (线路有波动)" \
-        "15% (线路不稳定)"
-    local _m=$?
-    local margins=(5 8 10 15)
-    tc_calculate "$bw" "${margins[$_m]}"
-
-    select_interface
-    apply_tc_shaping
-}
-
-# ================================================================
-#                     链路向导 (核心功能)
+#                     链路向导 (来自beta1.0完整交互)
 # ================================================================
 
 wizard_main() {
@@ -528,7 +454,6 @@ wizard_frontend() {
     echo -e "  ${DIM}链路位置: 用户 ─→ ${BOLD}[前置服务器]${NC}${DIM} ─→ IX/线路机${NC}"
     echo ""
 
-    # 用户方向
     echo -e "  ${WHITE}${BOLD}用户方向 (用户 → 本机)${NC}"
     local up_local up_remote up_ping
     read_int "本机上行带宽 (Mbps)" "" "up_local"
@@ -538,7 +463,6 @@ wizard_frontend() {
     local up_bw=$up_local
     [ $up_remote -lt $up_bw ] && up_bw=$up_remote
 
-    # 下游方向 (支持多条)
     echo ""
     echo -e "  ${WHITE}${BOLD}本机 → 下游 (IX/线路机/转发)${NC}"
     echo -e "  ${DIM}逐条输入本机连接的下游服务器${NC}"
@@ -550,8 +474,7 @@ wizard_frontend() {
     while true; do
         down_count=$(( down_count + 1 ))
         echo -e "  ${BOLD}${YELLOW}── 下游线路 #${down_count} ──${NC}"
-        tput cnorm 2>/dev/null
-        stty sane 2>/dev/null
+        tput cnorm 2>/dev/null; stty sane 2>/dev/null
         echo -ne "  ${WHITE}线路名称 (如: IX专线/HK线路机/SG直连): ${NC}"
         read line_name
         [ -z "$line_name" ] && line_name="下游${down_count}"
@@ -561,7 +484,6 @@ wizard_frontend() {
         read_int "  ${line_name}的带宽 (Mbps)" "300" "l_remote"
         read_int "  本机到${line_name}单程ping (ms)" "" "l_ping"
         local l_rtt=$(( l_ping * 2 ))
-        # 瓶颈
         local l_bw=$l_local
         [ $l_remote -lt $l_bw ] && l_bw=$l_remote
         local l_bdp=$(( l_bw * l_rtt * 125 ))
@@ -576,13 +498,10 @@ wizard_frontend() {
 # 下游${down_count}: ${line_name} | 本机${l_local}M/${line_name}${l_remote}M → 瓶颈${l_bw}Mbps | 单程${l_ping}ms | RTT ${l_rtt}ms | BDP $(( l_bdp / 1024 ))KB"
 
         echo ""
-        if ! confirm_action "还有更多下游线路?"; then
-            break
-        fi
+        if ! confirm_action "还有更多下游线路?"; then break; fi
         echo ""
     done
 
-    # 计算结果
     local bdp_up=$(( up_bw * up_rtt * 125 ))
     echo ""
     echo -e "  ${GREEN}━━━ 计算结果 ━━━${NC}"
@@ -594,8 +513,6 @@ wizard_frontend() {
 # 用户方向: 本机${up_local}Mbps / 用户${up_remote}Mbps → 瓶颈${up_bw}Mbps | 单程${up_ping}ms | RTT ${up_rtt}ms
 # 下游线路数: ${down_count}${all_down_header}"
 
-    # 传参: 用户方向和下游最大BDP方向
-    # 确定实际生效的最大BDP方向
     local eff_bw=$up_bw eff_rtt=$up_rtt
     if [ $max_down_bdp -gt $bdp_up ]; then
         eff_bw=$main_down_bw; eff_rtt=$main_down_rtt
@@ -608,24 +525,6 @@ wizard_frontend() {
 
     apply_sysctl_config "前置服务器 (瓶颈${eff_bw}Mbps/BDP $(( eff_bdp / 1024 ))KB)" "$config"
 
-    # TC限速 (按本机上行带宽)
-    if confirm_action "是否配置TC限速? (推荐，避免打满上行)"; then
-        echo ""
-        select_menu "限速方式" \
-            "自动计算 (本机上行${up_local}Mbps × 92% = $(( up_local * 920 / 1000 )).$(( (up_local * 920 % 1000) / 100 ))Mbps)" \
-            "自定义设置"
-        case $? in
-            0) tc_calculate "$up_local" 8 ;;
-            1)
-                local tc_bw tc_margins=(5 8 10 15)
-                read_int "限速带宽 (Mbps)" "$up_local" "tc_bw"
-                select_menu "余量" "5%" "8% (推荐)" "10%" "15%"
-                tc_calculate "$tc_bw" "${tc_margins[$?]}"
-                ;;
-        esac
-        select_interface
-        apply_tc_shaping
-    fi
 }
 
 # ==================== ② IX专线服务器向导 ====================
@@ -635,7 +534,6 @@ wizard_ix() {
     echo -e "  ${DIM}链路位置: 前置(多台) ─→ ${BOLD}[IX专线服务器]${NC}${DIM} ─→ 下游(多台)${NC}"
     echo ""
 
-    # 收集上游线路 (前置方向)
     local max_bdp=0 max_bw=0
     local up_count=0 all_up_header=""
     local main_bw=0 main_rtt=0
@@ -647,8 +545,7 @@ wizard_ix() {
     while true; do
         up_count=$(( up_count + 1 ))
         echo -e "  ${BOLD}${YELLOW}── 上游线路 #${up_count} ──${NC}"
-        tput cnorm 2>/dev/null
-        stty sane 2>/dev/null
+        tput cnorm 2>/dev/null; stty sane 2>/dev/null
         echo -ne "  ${WHITE}线路名称 (如: 前置5M/前置55M/前置300M): ${NC}"
         read line_name
         [ -z "$line_name" ] && line_name="上游${up_count}"
@@ -668,13 +565,10 @@ wizard_ix() {
 # 上游${up_count}: ${line_name} | ${l_bw}Mbps | 单程${l_ping}ms | RTT ${l_rtt}ms | BDP $(( l_bdp / 1024 ))KB"
 
         echo ""
-        if ! confirm_action "还有更多上游线路?"; then
-            break
-        fi
+        if ! confirm_action "还有更多上游线路?"; then break; fi
         echo ""
     done
 
-    # 收集下游线路 (国际转发/东京方向)
     local down_count=0 all_down_header=""
 
     echo ""
@@ -685,8 +579,7 @@ wizard_ix() {
     while true; do
         down_count=$(( down_count + 1 ))
         echo -e "  ${BOLD}${YELLOW}── 下游线路 #${down_count} ──${NC}"
-        tput cnorm 2>/dev/null
-        stty sane 2>/dev/null
+        tput cnorm 2>/dev/null; stty sane 2>/dev/null
         echo -ne "  ${WHITE}线路名称 (如: 东京落地/HK转发/SG转发): ${NC}"
         read line_name
         [ -z "$line_name" ] && line_name="下游${down_count}"
@@ -706,9 +599,7 @@ wizard_ix() {
 # 下游${down_count}: ${line_name} | ${l_bw}Mbps | 单程${l_ping}ms | RTT ${l_rtt}ms | BDP $(( l_bdp / 1024 ))KB"
 
         echo ""
-        if ! confirm_action "还有更多下游线路?"; then
-            break
-        fi
+        if ! confirm_action "还有更多下游线路?"; then break; fi
         echo ""
     done
 
@@ -723,8 +614,6 @@ wizard_ix() {
         has_proxy="yes"
     fi
 
-    # 找次要方向BDP (用于calculate_and_generate的第二组参数)
-    # 简化处理: 用max_bw和一个中等RTT
     local sec_bw=$max_bw sec_rtt=12
     [ $main_rtt -eq 12 ] && sec_rtt=50
 
@@ -740,29 +629,26 @@ wizard_ix() {
 
     apply_sysctl_config "IX专线服务器 (${up_count}上游/${down_count}下游)" "$config"
 
-    echo -e "  ${DIM}IX服务器通常无需TC限速（专线带宽固定）${NC}"
 }
 
+# ==================== ③ 国际转发/直接线路服务器向导 ====================
 wizard_relay() {
     echo ""
     echo -e "  ${BOLD}${CYAN}━━━ ③ 国际转发/直接线路服务器配置向导 ━━━${NC}"
     echo -e "  ${DIM}链路位置: IX/前置 ─→ ${BOLD}[本机]${NC}${DIM} ─→ 落地服务器${NC}"
     echo ""
 
-    # 先问本机带宽（后面每个方向都用到）
     local my_bw
     read_int "本机带宽 (Mbps)" "" "my_bw"
 
     # 国内直连
     local is_cn_optimize="no"
-    local cn_bw=0 cn_ping=0 cn_rtt=0
+    local cn_bw=0 cn_ping=0 cn_rtt=0 cn_remote=0
     echo ""
     if confirm_action "此服务器是否同时做中国优化节点? (国内前置直连，不走IX)"; then
         is_cn_optimize="yes"
         echo ""
         echo -e "  ${WHITE}${BOLD}国内直连方向 (前置 → 本机)${NC}"
-        echo -e "  ${DIM}前置服务器不经过IX，直接连到本机${NC}"
-        local cn_remote cn_ping
         read_int "前置服务器带宽 (Mbps)" "" "cn_remote"
         read_int "前置到本机单程ping (ms)" "" "cn_ping"
         cn_rtt=$(( cn_ping * 2 ))
@@ -830,34 +716,26 @@ wizard_relay() {
 # 缓冲区按最大BDP $(( bdp_max / 1024 ))KB 计算
 # 翻墙代理: ${has_proxy}"
 
-    # 取最大BDP方向
     local main_bw=$up_bw main_rtt=$up_rtt
     local sec_bw=$down_bw sec_rtt=$down_rtt
 
     if [ $bdp_cn -ge $bdp_up ] && [ $bdp_cn -ge $bdp_down ]; then
         main_bw=$cn_bw; main_rtt=$cn_rtt
-        if [ $bdp_up -ge $bdp_down ]; then
-            sec_bw=$up_bw; sec_rtt=$up_rtt
-        else
-            sec_bw=$down_bw; sec_rtt=$down_rtt
-        fi
+        if [ $bdp_up -ge $bdp_down ]; then sec_bw=$up_bw; sec_rtt=$up_rtt
+        else sec_bw=$down_bw; sec_rtt=$down_rtt; fi
     elif [ $bdp_down -ge $bdp_up ]; then
         main_bw=$down_bw; main_rtt=$down_rtt
         sec_bw=$up_bw; sec_rtt=$up_rtt
     fi
 
     local eff_bdp=$(( main_bw * main_rtt * 125 ))
-    local display_bw=$main_bw
 
     local config
-    config=$(calculate_and_generate "国际转发/线路服务器 (瓶颈${display_bw}Mbps/BDP $(( eff_bdp / 1024 ))KB)" \
+    config=$(calculate_and_generate "国际转发/线路服务器 (瓶颈${main_bw}Mbps/BDP $(( eff_bdp / 1024 ))KB)" \
         "$main_bw" "$main_rtt" "$sec_bw" "$sec_rtt" "$header")
 
-    apply_sysctl_config "国际转发/线路服务器 (瓶颈${display_bw}Mbps/BDP $(( eff_bdp / 1024 ))KB)" "$config"
+    apply_sysctl_config "国际转发/线路服务器 (瓶颈${main_bw}Mbps/BDP $(( eff_bdp / 1024 ))KB)" "$config"
 
-    if confirm_action "是否配置TC限速?"; then
-        tc_setup
-    fi
 }
 
 # ==================== ④ 落地服务器向导 ====================
@@ -867,25 +745,16 @@ wizard_landing() {
     echo -e "  ${DIM}链路位置: 上游节点 ─→ ${BOLD}[落地服务器]${NC}${DIM} ─→ 目标网站/家宽${NC}"
     echo ""
 
-    # 收集多条上游线路
-    local line_count=0
-    local max_bdp=0
-    local all_header=""
-    local max_bw=0
-    local main_bw=0 main_rtt=0
+    local line_count=0 max_bdp=0 all_header="" max_bw=0 main_bw=0 main_rtt=0
 
     echo -e "  ${WHITE}${BOLD}本机 ← 上游线路${NC}"
     echo -e "  ${DIM}本机可能有多条上游线路（IX直连、国际转发、线路机等）${NC}"
-    echo -e "  ${DIM}逐条输入，全部BDP取最大值来计算缓冲区${NC}"
     echo ""
 
     while true; do
         line_count=$(( line_count + 1 ))
         echo -e "  ${BOLD}${YELLOW}── 上游线路 #${line_count} ──${NC}"
-
-        # 线路名称
-        tput cnorm 2>/dev/null
-        stty sane 2>/dev/null
+        tput cnorm 2>/dev/null; stty sane 2>/dev/null
         echo -ne "  ${WHITE}线路名称 (如: IX直连/国际转发/HK线路): ${NC}"
         read line_name
         [ -z "$line_name" ] && line_name="线路${line_count}"
@@ -898,34 +767,25 @@ wizard_landing() {
 
         echo -e "  ${DIM}→ ${line_name}: ${l_bw}Mbps × ${l_rtt}ms RTT = $(( l_bdp / 1024 ))KB BDP${NC}"
 
-        # 记录最大BDP和对应的带宽RTT
         if [ $l_bdp -gt $max_bdp ]; then
-            max_bdp=$l_bdp
-            main_bw=$l_bw
-            main_rtt=$l_rtt
+            max_bdp=$l_bdp; main_bw=$l_bw; main_rtt=$l_rtt
         fi
         [ $l_bw -gt $max_bw ] && max_bw=$l_bw
 
-        # 累积header
         all_header="${all_header}
 # 上游线路${line_count}: ${line_name} | ${l_bw}Mbps | 单程${l_ping}ms | RTT ${l_rtt}ms | BDP $(( l_bdp / 1024 ))KB"
 
-        # 第一条线路兜底
         if [ $line_count -eq 1 ]; then
             main_bw=$l_bw; main_rtt=$l_rtt
         fi
 
         echo ""
-        if ! confirm_action "还有更多上游线路?"; then
-            break
-        fi
+        if ! confirm_action "还有更多上游线路?"; then break; fi
         echo ""
     done
 
-    # 下游信息
     echo ""
     echo -e "  ${WHITE}${BOLD}本机 → 出口方向 (目标网站/家宽)${NC}"
-    echo -e "  ${DIM}本机通常在目标国本地，到网站延迟很低${NC}"
     local down_bw down_ping
     read_int "本机出口带宽 (Mbps)" "$max_bw" "down_bw"
     read_int "本机到目标网站单程ping (ms)" "3" "down_ping"
@@ -937,7 +797,6 @@ wizard_landing() {
     echo -e "  ${WHITE}上游最大BDP: ${BOLD}$(( max_bdp / 1024 ))KB${NC} (共${line_count}条线路)"
     echo -e "  ${WHITE}本地方向:    ${BOLD}${down_bw}Mbps × ${down_rtt}ms RTT = $(( bdp_down / 1024 ))KB BDP${NC}"
 
-    # 取最终最大BDP
     [ $bdp_down -gt $max_bdp ] && max_bdp=$bdp_down
 
     echo ""
@@ -958,8 +817,6 @@ wizard_landing() {
 
     apply_sysctl_config "落地服务器 (${line_count}条上游)" "$config"
 }
-
-# ================================================================
 
 # ================================================================
 #                      状态与服务管理
@@ -983,19 +840,10 @@ show_status() {
     echo -e "  拥塞控制: ${BOLD}$cc${NC} | 队列: ${BOLD}$qd${NC}"
     echo -e "  rmem_max: ${BOLD}$(( rmem / 1024 / 1024 ))MB${NC} | notsent_lowat: ${BOLD}$(( lowat / 1024 ))KB${NC}"
 
-    echo ""
-    local iface=$(detect_interface)
-    if [ -f "$TC_CONF" ]; then
-        source "$TC_CONF"
-        echo -e "  ${WHITE}TC限速: ${BOLD}$TC_DESC${NC}"
-    else
-        echo -e "  ${DIM}TC限速: 未配置${NC}"
-    fi
-
-    echo -e "  ${BOLD}[出方向]${NC}"
-    tc -s qdisc show dev "$iface" 2>/dev/null | sed 's/^/  /'
-    echo -e "  ${BOLD}[入方向]${NC}"
-    tc -s qdisc show dev "$IFB_DEV" 2>/dev/null | sed 's/^/  /' || echo "  (未启用)"
+    # 内存信息 (来自beta1.3)
+    local s_mem=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{printf "%.0f", $2/1024}')
+    local s_swap=$(grep SwapTotal /proc/meminfo 2>/dev/null | awk '{printf "%.0f", $2/1024}')
+    echo -e "  内存: ${BOLD}${s_mem}MB${NC} | Swap: ${BOLD}${s_swap}MB${NC}"
 
     echo ""
     echo -e "  ${BOLD}[地理白名单]${NC}"
@@ -1026,7 +874,7 @@ install_service() {
 
     cat > /etc/systemd/system/network-optimizer.service << EOF
 [Unit]
-Description=专线网络优化 (BBR + TC限速)
+Description=专线网络优化 (BBR + 白名单)
 After=network-online.target
 Wants=network-online.target
 
@@ -1051,14 +899,12 @@ EOF
 
 toggle_service() {
     if systemctl is-enabled network-optimizer.service >/dev/null 2>&1; then
-        # 已启用，关闭
         if confirm_action "确定关闭开机自启?"; then
             systemctl disable network-optimizer.service 2>/dev/null
             systemctl stop network-optimizer.service 2>/dev/null
             echo -e "  ${GREEN}开机自启已关闭${NC}"
         fi
     else
-        # 未启用，安装
         install_service
     fi
 }
@@ -1073,12 +919,9 @@ reload_network() {
     local conflict_found=0
     local conflict_files=""
 
-    # 检查sysctl.d下其他配置文件
     for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
         [ ! -f "$f" ] && continue
-        # 跳过我们自己的配置
         [ "$f" = "/etc/sysctl.d/99-network-optimize.conf" ] && continue
-        # 检查是否包含可能覆盖的网络参数
         if grep -qE "tcp_congestion_control|tcp_rmem|tcp_wmem|rmem_max|wmem_max|default_qdisc|tcp_notsent_lowat|tcp_slow_start|tcp_fastopen|tcp_tw_reuse|ip_forward" "$f" 2>/dev/null; then
             conflict_found=1
             local matched=$(grep -cE "tcp_congestion_control|tcp_rmem|tcp_wmem|rmem_max|wmem_max|default_qdisc|tcp_notsent_lowat" "$f" 2>/dev/null)
@@ -1087,7 +930,6 @@ reload_network() {
         fi
     done
 
-    # 检查NetworkManager的sysctl覆盖
     for f in /etc/NetworkManager/conf.d/*.conf /etc/NetworkManager/NetworkManager.conf; do
         [ ! -f "$f" ] && continue
         if grep -qiE "sysctl|tcp" "$f" 2>/dev/null; then
@@ -1097,7 +939,6 @@ reload_network() {
         fi
     done
 
-    # 检查systemd-sysctl相关
     for f in /usr/lib/sysctl.d/*.conf /run/sysctl.d/*.conf; do
         [ ! -f "$f" ] && continue
         if grep -qE "tcp_congestion_control|tcp_rmem|tcp_wmem|rmem_max|wmem_max|default_qdisc" "$f" 2>/dev/null; then
@@ -1111,14 +952,11 @@ reload_network() {
         echo ""
         if confirm_action "发现冲突配置，是否注释掉冲突参数? (原文件会备份为.bak)"; then
             for f in $conflict_files; do
-                # 跳过系统目录（只读）
                 if [[ "$f" == /usr/lib/* ]] || [[ "$f" == /run/* ]]; then
                     echo -e "  ${DIM}跳过只读文件: $f${NC}"
                     continue
                 fi
-                # 备份
                 cp "$f" "${f}.bak" 2>/dev/null
-                # 注释掉冲突行
                 sed -i -E '/^[^#]*(tcp_congestion_control|tcp_rmem|tcp_wmem|rmem_max|wmem_max|rmem_default|wmem_default|default_qdisc|tcp_notsent_lowat|tcp_slow_start_after_idle|tcp_no_metrics_save|tcp_fastopen|tcp_tw_reuse|tcp_fin_timeout|tcp_keepalive|tcp_sack|tcp_frto|tcp_ecn|tcp_mtu_probing|ip_forward|tcp_window_scaling|tcp_timestamps|tcp_max_syn_backlog|tcp_max_tw_buckets|somaxconn|netdev_max_backlog|udp_rmem_min|udp_wmem_min)/s/^/# [disabled by network-optimizer] /' "$f" 2>/dev/null
                 echo -e "  ${GREEN}✓${NC} 已处理: $f (备份: ${f}.bak)"
             done
@@ -1129,7 +967,6 @@ reload_network() {
 
     echo ""
 
-    # 刷新sysctl
     echo -ne "  [sysctl] 重新加载内核参数 ... "
     if [ -f "$SYSCTL_CONF" ] || [ -f /etc/sysctl.d/99-network-optimize.conf ]; then
         sysctl --system > /dev/null 2>&1
@@ -1138,30 +975,12 @@ reload_network() {
         echo -e "${YELLOW}跳过 (未找到配置文件)${NC}"
     fi
 
-    # 重新加载TC限速
-    if [ -f "$TC_CONF" ]; then
-        source "$TC_CONF"
-        echo -ne "  [tc] 重新应用限速 ($TC_DESC) ... "
-
-        tc qdisc del dev "$TC_IFACE" root 2>/dev/null
-        tc qdisc del dev "$TC_IFACE" ingress 2>/dev/null
-        tc qdisc del dev "$IFB_DEV" root 2>/dev/null
-        ip link set "$IFB_DEV" down 2>/dev/null
-
-        tc qdisc add dev "$TC_IFACE" root handle 1: tbf rate $TC_RATE burst $TC_BURST latency $TC_LATENCY && \
-        tc qdisc add dev "$TC_IFACE" parent 1:1 handle 10: fq && \
-        modprobe ifb numifbs=1 2>/dev/null && \
-        ip link set "$IFB_DEV" up && \
-        tc qdisc add dev "$TC_IFACE" handle ffff: ingress && \
-        tc filter add dev "$TC_IFACE" parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev "$IFB_DEV" && \
-        tc qdisc add dev "$IFB_DEV" root handle 1: tbf rate $TC_RATE burst $TC_BURST latency $TC_LATENCY && \
-        tc qdisc add dev "$IFB_DEV" parent 1:1 handle 10: fq && \
-        echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}"
-    else
-        echo -e "  ${DIM}[tc] 跳过 (未配置限速)${NC}"
+    # 重新加载白名单
+    if [ -f "$GEO_NFT" ]; then
+        echo -ne "  [geo] 重新加载白名单规则 ... "
+        nft -f "$GEO_NFT" 2>/dev/null && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}"
     fi
 
-    # 验证
     echo ""
     local cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     local qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
@@ -1173,80 +992,43 @@ reload_network() {
 
 service_start() {
     [ -f "$SYSCTL_CONF" ] && { echo "[sysctl] 应用配置..."; sysctl --system > /dev/null 2>&1; echo "[sysctl] 完成"; }
-    if [ -f "$TC_CONF" ]; then
-        source "$TC_CONF"
-        echo "[tc] 应用限速: $TC_DESC"
-        tc qdisc del dev "$TC_IFACE" root 2>/dev/null
-        tc qdisc del dev "$TC_IFACE" ingress 2>/dev/null
-        tc qdisc del dev "$IFB_DEV" root 2>/dev/null; ip link set "$IFB_DEV" down 2>/dev/null
-        tc qdisc add dev "$TC_IFACE" root handle 1: tbf rate $TC_RATE burst $TC_BURST latency $TC_LATENCY
-        tc qdisc add dev "$TC_IFACE" parent 1:1 handle 10: fq
-        modprobe ifb numifbs=1 2>/dev/null; ip link set "$IFB_DEV" up
-        tc qdisc add dev "$TC_IFACE" handle ffff: ingress
-        tc filter add dev "$TC_IFACE" parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev "$IFB_DEV"
-        tc qdisc add dev "$IFB_DEV" root handle 1: tbf rate $TC_RATE burst $TC_BURST latency $TC_LATENCY
-        tc qdisc add dev "$IFB_DEV" parent 1:1 handle 10: fq
-        echo "[tc] 完成"
-    fi
+
+    [ -f "$GEO_NFT" ] && { echo "[geo] 加载白名单..."; nft -f "$GEO_NFT" 2>/dev/null; echo "[geo] 完成"; }
 }
 
 service_stop() {
-    if [ -f "$TC_CONF" ]; then
-        source "$TC_CONF"
-        echo "[tc] 清除..."; tc qdisc del dev "$TC_IFACE" root 2>/dev/null
-        tc qdisc del dev "$TC_IFACE" ingress 2>/dev/null
-        tc qdisc del dev "$IFB_DEV" root 2>/dev/null; ip link set "$IFB_DEV" down 2>/dev/null
-        modprobe -r ifb 2>/dev/null; echo "[tc] 完成"
-    fi
+    echo "[service] 已停止"
 }
 
 restore_defaults() {
     echo ""
     confirm_action "确定恢复默认配置? (将删除所有优化配置)" || return
-    stop_tc 2>/dev/null
     rm -f /etc/sysctl.d/99-network-optimize.conf
     sysctl --system > /dev/null 2>&1
     systemctl disable network-optimizer.service 2>/dev/null
     rm -f /etc/systemd/system/network-optimizer.service
-    systemctl daemon-reload 2>/dev/null
-    # 清理配置目录 (保留备份)
-    if [ -d "$CONFIG_DIR" ]; then
-        if [ -f "$CONFIG_DIR/sysctl-backup.conf" ]; then
-            echo -e "  ${DIM}原始sysctl备份保留在: $CONFIG_DIR/sysctl-backup.conf${NC}"
-        fi
-        rm -f "$SYSCTL_CONF" "$TC_CONF" "$PROFILE_CONF" "$GEO_CONF" "$GEO_NFT"
-        rm -rf "$GEO_DIR"
-    fi
-    # 清理白名单
     nft delete table inet geo_filter 2>/dev/null
     systemctl disable geo-whitelist.service 2>/dev/null
     rm -f /etc/systemd/system/geo-whitelist.service
     systemctl daemon-reload 2>/dev/null
+    if [ -d "$CONFIG_DIR" ]; then
+        if [ -f "$CONFIG_DIR/sysctl-backup.conf" ]; then
+            echo -e "  ${DIM}原始sysctl备份保留在: $CONFIG_DIR/sysctl-backup.conf${NC}"
+        fi
+        rm -f "$SYSCTL_CONF" "$PROFILE_CONF" "$GEO_CONF" "$GEO_NFT"
+        rm -rf "$GEO_DIR"
+    fi
     echo -e "  ${GREEN}已恢复默认${NC}"
 }
 
 # ================================================================
-#                    国家访问白名单 (nftables)
+#                    国家访问白名单 (来自beta1.0完整功能)
 # ================================================================
-
-GEO_CONF="$CONFIG_DIR/geo-whitelist.conf"
-GEO_DIR="$CONFIG_DIR/geo-zones"
-GEO_NFT="$CONFIG_DIR/geo-nftables.nft"
-GEO_IP_SOURCE="https://www.ipdeny.com/ipblocks/data/aggregated"
-
-# 常用国家列表
-declare -A COUNTRY_NAMES=(
-    [cn]="中国" [hk]="香港" [tw]="台湾" [jp]="日本" [kr]="韩国"
-    [sg]="新加坡" [us]="美国" [gb]="英国" [de]="德国" [fr]="法国"
-    [au]="澳大利亚" [ca]="加拿大" [ru]="俄罗斯" [th]="泰国" [my]="马来西亚"
-    [vn]="越南" [id]="印尼" [ph]="菲律宾" [in]="印度" [nl]="荷兰"
-)
 
 geo_main() {
     while true; do
     echo ""
 
-    # 检查当前状态
     local geo_active="no"
     if nft list table inet geo_filter >/dev/null 2>&1; then
         geo_active="yes"
@@ -1268,7 +1050,6 @@ geo_main() {
     fi
     echo ""
 
-    # ping切换标签
     local ping_label="禁止 Ping"
     if [ -f "$GEO_CONF" ]; then
         source "$GEO_CONF"
@@ -1300,7 +1081,6 @@ geo_main() {
 
 geo_setup() {
     echo ""
-    # 检查依赖
     if ! command -v nft >/dev/null 2>&1; then
         echo -e "  ${RED}错误: 未安装 nftables${NC}"
         echo -e "  ${DIM}安装: apt install nftables -y${NC}"
@@ -1317,7 +1097,6 @@ geo_setup() {
     echo -e "  ${DIM}数据源: ipdeny.com (聚合IP段)${NC}"
     echo ""
 
-    # SSH端口安全
     echo -e "  ${RED}${BOLD}⚠ 安全提示: 必须确保SSH端口在白名单内，否则会被锁在外面${NC}"
     echo ""
     local ssh_port
@@ -1351,8 +1130,7 @@ geo_setup() {
     echo -e "  ${DIM}      de=德国 gb=英国 fr=法国 au=澳大利亚 ca=加拿大 nl=荷兰${NC}"
     echo -e "  ${DIM}      th=泰国 my=马来西亚 vn=越南 id=印尼 ph=菲律宾 in=印度 ru=俄罗斯${NC}"
     echo ""
-    tput cnorm 2>/dev/null
-    stty sane 2>/dev/null
+    tput cnorm 2>/dev/null; stty sane 2>/dev/null
 
     local countries=""
     while [ -z "$countries" ]; do
@@ -1362,21 +1140,17 @@ geo_setup() {
         if [ -z "$countries" ]; then
             echo -e "  ${RED}不能为空，请输入至少一个国家代码${NC}"
         fi
-        # 校验: 每个都应该是2位字母
         if [ -n "$countries" ]; then
-            local valid=1
             for cc in $countries; do
                 if ! [[ "$cc" =~ ^[a-z]{2}$ ]]; then
                     echo -e "  ${RED}无效代码: $cc (应为2位字母，如 cn/jp/us)${NC}"
                     countries=""
-                    valid=0
                     break
                 fi
             done
         fi
     done
 
-    # 显示选中的国家
     echo ""
     echo -e "  ${WHITE}已选择国家:${NC}"
     for cc in $countries; do
@@ -1388,14 +1162,11 @@ geo_setup() {
     echo ""
     echo -e "  ${WHITE}${BOLD}自定义白名单IP (可选)${NC}"
     echo -e "  ${DIM}添加不在上述国家范围内但需要放行的IP/段${NC}"
-    echo -e "  ${DIM}例如: 103.1.2.3 或 103.1.2.0/24，多个用空格分隔${NC}"
-    echo -e "  ${DIM}留空跳过${NC}"
-    tput cnorm 2>/dev/null
-    stty sane 2>/dev/null
+    echo -e "  ${DIM}例如: 103.1.2.3 或 103.1.2.0/24，多个用空格分隔，留空跳过${NC}"
+    tput cnorm 2>/dev/null; stty sane 2>/dev/null
     echo -ne "  ${WHITE}额外白名单IP: ${NC}"
     read custom_ips
 
-    # 校验: 过滤掉无效输入
     if [ -n "$custom_ips" ]; then
         local clean_ips=""
         for item in $custom_ips; do
@@ -1403,9 +1174,8 @@ geo_setup() {
                 clean_ips="$clean_ips $item"
             elif [[ "$item" =~ ^[a-zA-Z]{2,3}$ ]]; then
                 echo -e "  ${RED}⚠ '$item' 看起来是国家代码，不是IP地址，已跳过${NC}"
-                echo -e "  ${DIM}  国家代码请在上一步输入${NC}"
             else
-                echo -e "  ${YELLOW}跳过无效输入: $item (格式: 1.2.3.4 或 1.2.3.0/24)${NC}"
+                echo -e "  ${YELLOW}跳过无效输入: $item${NC}"
             fi
         done
         custom_ips=$(echo "$clean_ips" | xargs)
@@ -1432,7 +1202,6 @@ geo_setup() {
         return
     fi
 
-    # 保存配置
     init_config_dir
     mkdir -p "$GEO_DIR"
     cat > "$GEO_CONF" << EOF
@@ -1443,7 +1212,6 @@ GEO_CHAIN_MODE="$chain_mode"
 GEO_ALLOW_PING="$allow_ping"
 EOF
 
-    # 加载IP数据并应用 (优先用本地缓存)
     geo_load_and_apply "$countries" "$ssh_port" "$custom_ips" "$chain_mode" "$allow_ping" "no"
 }
 
@@ -1462,9 +1230,7 @@ geo_load_and_apply() {
     local all_ips=""
     local fail_count=0
 
-    # 分类: 哪些用缓存，哪些要下载
-    local need_download=""
-    local use_cache=""
+    local need_download="" use_cache=""
 
     for cc in $countries; do
         local zone_file="$GEO_DIR/${cc}.zone"
@@ -1475,19 +1241,16 @@ geo_load_and_apply() {
         fi
     done
 
-    # 显示缓存命中
     for cc in $use_cache; do
         local name="${COUNTRY_NAMES[$cc]:-$cc}"
         local count=$(wc -l < "$GEO_DIR/${cc}.zone")
         echo -e "  $cc ($name) ... ${GREEN}缓存${NC} (${count}条)"
     done
 
-    # 并行下载需要的文件
     if [ -n "$need_download" ]; then
         local dl_count=$(echo $need_download | wc -w)
         echo -e "  ${CYAN}并行下载 ${dl_count} 个国家IP数据库...${NC}"
 
-        # 创建临时目录存放下载状态
         local tmp_status=$(mktemp -d)
 
         for cc in $need_download; do
@@ -1501,11 +1264,8 @@ geo_load_and_apply() {
                 fi
             ) &
         done
-
-        # 等待所有下载完成
         wait
 
-        # 显示下载结果
         for cc in $need_download; do
             local name="${COUNTRY_NAMES[$cc]:-$cc}"
             local zone_file="$GEO_DIR/${cc}.zone"
@@ -1525,7 +1285,6 @@ geo_load_and_apply() {
         rm -rf "$tmp_status"
     fi
 
-    # 读取所有IP段
     for cc in $countries; do
         local zone_file="$GEO_DIR/${cc}.zone"
         [ ! -f "$zone_file" ] && continue
@@ -1546,7 +1305,6 @@ geo_load_and_apply() {
     echo ""
     echo -ne "  生成 nftables 规则 (模式: ${chain_mode}) ... "
 
-    # 构建自定义IP规则
     local custom_input_rules=""
     local custom_forward_rules=""
     if [ -n "$custom_ips" ]; then
@@ -1558,7 +1316,6 @@ geo_load_and_apply() {
         done
     fi
 
-    # ICMP规则
     local icmp_rule=""
     if [ "$allow_ping" = "yes" ]; then
         icmp_rule="
@@ -1570,36 +1327,29 @@ geo_load_and_apply() {
         ip protocol icmp drop"
     fi
 
-    # 构建forward链 (仅在input+forward模式下)
     local forward_chain=""
     if [ "$chain_mode" = "input+forward" ]; then
         forward_chain="
     chain forward {
         type filter hook forward priority 10; policy accept;
 
-        # 已建立的连接直接放行
         ct state established,related accept
 
-        # 私网地址放行 (服务器间通信)
         ip saddr 10.0.0.0/8 accept
         ip saddr 172.16.0.0/12 accept
         ip saddr 192.168.0.0/16 accept
         ip saddr 100.64.0.0/10 accept
 
-        # 白名单国家放行
         ip saddr @whitelist_v4 accept
 ${custom_forward_rules}
 
-        # 其余转发流量拒绝
         counter drop
     }"
     fi
 
-    # 生成nftables规则文件
     cat > "$GEO_NFT" << NFTEOF
 #!/usr/sbin/nft -f
 
-# 清理旧规则
 table inet geo_filter
 delete table inet geo_filter
 
@@ -1614,28 +1364,21 @@ table inet geo_filter {
     chain input {
         type filter hook input priority 10; policy accept;
 
-        # 已建立的连接直接放行
         ct state established,related accept
-
-        # 回环接口放行
         iif "lo" accept
 
-        # 私网地址放行 (服务器间通信)
         ip saddr 10.0.0.0/8 accept
         ip saddr 172.16.0.0/12 accept
         ip saddr 192.168.0.0/16 accept
         ip saddr 100.64.0.0/10 accept
         ip saddr 127.0.0.0/8 accept
 
-        # SSH端口对所有IP开放 (防锁)
         tcp dport ${ssh_port} accept
 ${icmp_rule}
 
-        # 白名单国家放行
         ip saddr @whitelist_v4 accept
 ${custom_input_rules}
 
-        # 其余全部拒绝
         counter drop
     }
 ${forward_chain}
@@ -1644,7 +1387,6 @@ NFTEOF
 
     echo -e "${GREEN}✓${NC}"
 
-    # 应用规则
     echo -ne "  应用 nftables 规则 ... "
     if nft -f "$GEO_NFT" 2>/dev/null; then
         echo -e "${GREEN}✓${NC}"
@@ -1674,7 +1416,6 @@ SVCEOF
     systemctl daemon-reload
     systemctl enable geo-whitelist.service 2>/dev/null
 
-    # 记录更新时间
     sed -i '/^GEO_LAST_UPDATE=/d' "$GEO_CONF" 2>/dev/null
     echo "GEO_LAST_UPDATE=\"$(date '+%Y-%m-%d %H:%M:%S')\"" >> "$GEO_CONF"
 
@@ -1716,10 +1457,7 @@ geo_toggle_ping() {
         echo -e "  ${GREEN}切换 Ping: 禁止 → 允许${NC}"
     fi
 
-    # 更新配置文件
     sed -i "s/^GEO_ALLOW_PING=.*/GEO_ALLOW_PING=\"$new_ping\"/" "$GEO_CONF"
-
-    # 重新应用规则
     source "$GEO_CONF"
     geo_load_and_apply "$GEO_COUNTRIES" "$GEO_SSH_PORT" "$GEO_CUSTOM_IPS" "${GEO_CHAIN_MODE:-input}" "$new_ping" "no"
 }
@@ -1747,7 +1485,6 @@ geo_status() {
             [ -n "${GEO_LAST_UPDATE:-}" ] && echo -e "  ${WHITE}上次更新: ${BOLD}${GEO_LAST_UPDATE}${NC}"
         fi
 
-        # 统计
         echo ""
         local input_drop=$(nft list chain inet geo_filter input 2>/dev/null | grep -oP 'counter packets \K[0-9]+' | tail -1 || echo "0")
         echo -e "  ${WHITE}入站拦截: ${BOLD}${input_drop}${NC} 个数据包"
@@ -1757,7 +1494,6 @@ geo_status() {
             echo -e "  ${WHITE}转发拦截: ${BOLD}${forward_drop}${NC} 个数据包"
         fi
 
-        # 显示规则摘要
         echo ""
         echo -e "  ${DIM}规则摘要 (input):${NC}"
         nft list chain inet geo_filter input 2>/dev/null | grep -E "accept|drop" | head -8 | sed 's/^/  /'
@@ -1791,7 +1527,7 @@ geo_remove() {
 }
 
 # ================================================================
-#                     端口连接监控
+#                     端口连接监控 (来自beta1.0完整功能)
 # ================================================================
 
 port_monitor() {
@@ -1821,7 +1557,6 @@ port_show_all() {
     echo -e "  ${BOLD}${CYAN}━━━ 所有监听端口连接情况 ━━━${NC}"
     echo ""
 
-    # 获取所有监听端口
     local ports=$(ss -tlnH 2>/dev/null | awk '{print $4}' | grep -oP '(?<=:)\d+$' | sort -un)
 
     if [ -z "$ports" ]; then
@@ -1829,19 +1564,14 @@ port_show_all() {
         return
     fi
 
-    # 表头
     printf "  ${BOLD}${WHITE}%-8s %-20s %-8s %-8s${NC}\n" "端口" "服务" "连接数" "独立IP数"
     printf "  ${DIM}%-8s %-20s %-8s %-8s${NC}\n" "────" "────────────" "──────" "────────"
 
     for port in $ports; do
-        # 获取连接数
         local conn_count=$(ss -tnH 2>/dev/null | awk '{print $5}' | grep -c ":${port}$" || echo "0")
-        # 获取独立IP数
         local ip_count=$(ss -tnH 2>/dev/null | awk '{print $5}' | grep ":${port}$" | awk -F: '{print $1}' | sort -u | grep -cv '^$' || echo "0")
-        # 猜测服务名
         local svc_name=$(port_guess_service "$port")
 
-        # 颜色: 连接数多的高亮
         if [ "$conn_count" -ge 100 ]; then
             printf "  ${RED}%-8s${NC} ${DIM}%-20s${NC} ${RED}${BOLD}%-8s${NC} ${YELLOW}%-8s${NC}\n" "$port" "$svc_name" "$conn_count" "$ip_count"
         elif [ "$conn_count" -ge 10 ]; then
@@ -1860,8 +1590,7 @@ port_show_all() {
 
 port_show_single() {
     echo ""
-    tput cnorm 2>/dev/null
-    stty sane 2>/dev/null
+    tput cnorm 2>/dev/null; stty sane 2>/dev/null
     local port
     read_int "输入要查看的端口号" "" "port"
 
@@ -1872,7 +1601,6 @@ port_show_single() {
     echo -e "  ${DIM}服务: ${svc_name}${NC}"
     echo ""
 
-    # 获取连接到此端口的所有IP及其连接数
     local ip_list=$(ss -tnH 2>/dev/null | awk '{print $5}' | grep ":${port}$" | grep -oP '^[^:]+' | sort | uniq -c | sort -rn)
 
     if [ -z "$ip_list" ]; then
@@ -1889,7 +1617,6 @@ port_show_single() {
         [ -z "$ip" ] && continue
         total=$(( total + count ))
 
-        # 获取该IP的连接状态分布
         local states=$(ss -tnH 2>/dev/null | grep "${ip}.*:${port}" | awk '{print $1}' | sort | uniq -c | sort -rn | awk '{printf "%s(%s) ", $2, $1}')
 
         if [ "$count" -ge 50 ]; then
@@ -1912,7 +1639,6 @@ port_show_ranking() {
     echo -e "  ${BOLD}${CYAN}━━━ 实时连接排行 ━━━${NC}"
     echo ""
 
-    # IP连接数排行
     echo -e "  ${WHITE}${BOLD}[TOP 20 IP - 按连接数排序]${NC}"
     echo ""
     printf "  ${BOLD}%-6s %-40s %-10s${NC}\n" "排名" "IP地址" "连接数"
@@ -1931,7 +1657,6 @@ port_show_ranking() {
         fi
     done
 
-    # 端口连接数排行
     echo ""
     echo -e "  ${WHITE}${BOLD}[TOP 20 端口 - 按连接数排序]${NC}"
     echo ""
@@ -1951,7 +1676,6 @@ port_show_ranking() {
         fi
     done
 
-    # 连接状态分布
     echo ""
     echo -e "  ${WHITE}${BOLD}[连接状态分布]${NC}"
     echo ""
@@ -1962,7 +1686,6 @@ port_show_ranking() {
     echo ""
 }
 
-# 常见端口服务名猜测
 port_guess_service() {
     local p="$1"
     case "$p" in
@@ -1986,8 +1709,7 @@ port_guess_service() {
         8388)  echo "Shadowsocks" ;;
         10000|10001|10002) echo "Proxy/Custom" ;;
         *)
-            # 尝试从ss获取进程名
-            local proc=$(ss -tlnpH 2>/dev/null | grep ":${p} " | grep -oP 'users:\(\("\K[^"]+' | head -1)
+            local proc=$(ss -tlnpH 2>/dev/null | grep ":${p} " | grep -oP 'users:\(\("\\K[^"]+' | head -1)
             [ -n "$proc" ] && echo "$proc" || echo "-"
             ;;
     esac
@@ -2002,7 +1724,7 @@ interactive_main() {
     clear
     echo ""
     echo -e "  ${BOLD}${WHITE}╔════════════════════════════════════════════════╗${NC}"
-    echo -e "  ${BOLD}${WHITE}║        专线网络优化工具 beta1.0                ║${NC}"
+    echo -e "  ${BOLD}${WHITE}║        专线网络优化工具 $VERSION                  ║${NC}"
     echo -e "  ${BOLD}${WHITE}╚════════════════════════════════════════════════╝${NC}"
     echo ""
 
@@ -2013,14 +1735,6 @@ interactive_main() {
         echo -e "  ${GREEN}●${NC} BBR优化:  ${WHITE}$SYSCTL_PROFILE_NAME${NC}"
     else
         echo -e "  ${DIM}○ BBR优化:  未配置 ($cc)${NC}"
-    fi
-
-    local iface=$(detect_interface)
-    if [ -n "$iface" ] && tc qdisc show dev "$iface" 2>/dev/null | grep -q tbf; then
-        [ -f "$TC_CONF" ] && source "$TC_CONF"
-        echo -e "  ${GREEN}●${NC} TC限速:   ${WHITE}${TC_DESC:-已启用}${NC}"
-    else
-        echo -e "  ${DIM}○ TC限速:   未启用${NC}"
     fi
 
     if nft list table inet geo_filter >/dev/null 2>&1; then
@@ -2037,12 +1751,16 @@ interactive_main() {
     else
         echo -e "  ${DIM}○ 开机自启: 未启用${NC}"
     fi
+
+    # 内存摘要
+    local s_mem=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{printf "%.0f", $2/1024}')
+    local s_swap=$(grep SwapTotal /proc/meminfo 2>/dev/null | awk '{printf "%.0f", $2/1024}')
+    echo -e "  ${DIM}内存: ${s_mem}MB | Swap: ${s_swap}MB${NC}"
     echo ""
 
     select_menu "选择操作" \
         "[配置] BBR网络优化 (链路向导)" \
-        "[配置] TC流量限速" \
-        "[配置] 国家访问白名单" \
+"[配置] 国家访问白名单" \
         "[监控] 查看系统状态" \
         "[监控] 端口连接监控" \
         "[管理] 刷新网络配置 (不重启立即生效)" \
@@ -2052,14 +1770,13 @@ interactive_main() {
 
     case $? in
         0) wizard_main ;;
-        1) tc_menu; continue ;;
-        2) geo_main; continue ;;
-        3) show_status ;;
-        4) port_monitor; continue ;;
-        5) reload_network ;;
-        6) toggle_service ;;
-        7) restore_defaults ;;
-        8) tput cnorm 2>/dev/null; stty sane 2>/dev/null; exit 0 ;;
+        1) geo_main; continue ;;
+        2) show_status ;;
+        3) port_monitor; continue ;;
+        4) reload_network ;;
+        5) toggle_service ;;
+        6) restore_defaults ;;
+        7) tput cnorm 2>/dev/null; stty sane 2>/dev/null; exit 0 ;;
     esac
 
     echo ""
@@ -2075,7 +1792,6 @@ interactive_main() {
 case "${1}" in
     start|service-start) service_start ;;
     stop|service-stop)   service_stop ;;
-    tc-stop)             stop_tc ;;
     status)              show_status ;;
     install)             install_service ;;
     restore)             restore_defaults ;;
@@ -2087,13 +1803,12 @@ case "${1}" in
     ports-rank)          port_show_ranking ;;
     "")                  interactive_main ;;
     *)
-        echo "专线网络优化工具 beta1.0"
+        echo "专线网络优化工具 $VERSION"
         echo ""
         echo "用法: $0 [命令]"
         echo "  无参数      交互式菜单"
         echo "  wizard      链路向导"
         echo "  start       启动已保存配置"
-        echo "  stop        停止TC限速"
         echo "  status      查看状态"
         echo "  ports       查看端口连接"
         echo "  ports-rank  连接排行榜"
