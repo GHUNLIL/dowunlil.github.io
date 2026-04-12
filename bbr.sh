@@ -141,12 +141,11 @@ calculate_and_generate() {
     local bdp_up=$(( up_bw * up_rtt * 125 ))
     local bdp_dn=$(( down_bw * down_rtt * 125 ))
     local bdp=$bdp_up; [ $bdp_dn -gt $bdp ] && bdp=$bdp_dn
-    local neck=$up_bw; [ $down_bw -lt $neck ] && neck=$down_bw
     local mbw=$up_bw; [ $down_bw -gt $mbw ] && mbw=$down_bw
 
     # 缓冲区
     local def=$(( (bdp / 65536 + 1) * 65536 ))
-    [ $def -lt 131072 ] && def=131072; [ $def -gt 4194304 ] && def=4194304
+    [ $def -lt 131072 ] && def=131072; [ $def -gt 2097152 ] && def=2097152
     local max=$(( (bdp * 2 + 1048575) / 1048576 * 1048576 ))
     [ $max -lt 1048576 ] && max=1048576; [ $max -gt 134217728 ] && max=134217728
     [ $def -gt $(( max / 2 )) ] && def=$(( max / 2 ))
@@ -162,14 +161,14 @@ calculate_and_generate() {
     [ $ml -lt 65536 ] && ml=65536; [ $mp -lt 98304 ] && mp=98304; [ $mh -lt 131072 ] && mh=131072
 
     # 动态参数
-    local lowat=$(clamp $(( neck * 128 )) 8192 524288)
+    local lowat=$(clamp $(( mbw * 128 )) 16384 524288)
     local smc=$(clamp $(( mbw * 66 )) 1024 65535)
     local synbl=$(clamp $(( mbw * 32 )) 512 262144)
     local ndbl=$(clamp $(( mbw * 64 )) 1000 524288)
     local tw=$(clamp $(( mbw * 4000 )) 65536 16000000)
     local orph=$(clamp $(( mbw * 128 )) 2048 524288)
     local fmax=$(clamp $(( mbw * 2048 )) 65536 10485760)
-    local udpr=$(clamp $(( bdp / 8 )) 16384 4194304)
+    local udpr=$(clamp $(( bdp / 8 )) 16384 524288)
     local udpml=$(( udpr * 2 / 4096 )); [ $udpml -lt 4096 ] && udpml=4096
     local fin=$(clamp $(( 30 - mbw / 200 )) 5 30)
     local omem=$(clamp $(( mbw * 105 )) 65536 1048576)
