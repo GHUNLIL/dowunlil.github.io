@@ -12,11 +12,11 @@
 # ----------------------------------------------------------------------------
 # 使用
 # ----------------------------------------------------------------------------
-#   bash sk5.sh                                  # 默认 unlil/unlil/61080
-#   bash sk5.sh -u admin -p MyPass -P 1080       # 自定义
+#   bash sk5.sh                                      # 默认 unlil/unlil/61080
+#   bash sk5.sh -u admin -p MyPass --port 1080       # 自定义
 #   curl -fsSL https://你的地址/sk5.sh | bash
-#   curl -fsSL https://你的地址/sk5.sh | bash -s -- -u admin -p MyPass -P 1080
-#   bash sk5.sh --uninstall                      # 卸载
+#   curl -fsSL https://你的地址/sk5.sh | bash -s -- -u admin -p MyPass --port 1080
+#   bash sk5.sh --uninstall                          # 卸载
 #
 # ----------------------------------------------------------------------------
 # 部署后管理
@@ -76,7 +76,7 @@ SOCKS5 一键部署脚本 (sing-box)
 选项:
   -u, --user USER    用户名 (默认: unlil)
   -p, --pass PASS    密码   (默认: unlil)
-  -P, --port PORT    端口   (默认: 61080)
+      --port PORT    端口   (默认: 61080)
       --uninstall    卸载 sing-box
   -h, --help         显示帮助
 EOF
@@ -88,7 +88,7 @@ parse_args() {
         case "$1" in
             -u|--user)    SOCKS5_USER="${2:-}"; shift 2 ;;
             -p|--pass)    SOCKS5_PASS="${2:-}"; shift 2 ;;
-            -P|--port)    SOCKS5_PORT="${2:-}"; shift 2 ;;
+            --port)       SOCKS5_PORT="${2:-}"; shift 2 ;;
             --uninstall)  ACTION="uninstall"; shift ;;
             -h|--help)    usage ;;
             *) log_warn "忽略未知参数: $1"; shift ;;
