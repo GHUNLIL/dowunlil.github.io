@@ -1,202 +1,276 @@
 #!/bin/bash
 #=============================================================================
-# Sing-box SOCKS5 一键部署脚本
-# 用法:
-#   bash socks5-deploy.sh [选项]
+# SOCKS5 一键部署脚本 (Ubuntu / Debian) — 基于 sing-box
 #
-# 选项:
-#   -u, --user     用户名        (默认: proxy)
-#   -p, --pass     密码          (默认: 随机生成)
-#   -P, --port     端口          (默认: 随机生成)
-#   -l, --listen   监听地址      (默认: 0.0.0.0，填 :: 为IPv6)
-#   -v, --version  sing-box版本  (默认: 自动获取最新)
-#   -h, --help     显示帮助
+# 默认账号: unlil  密码: unlil  端口: 61080
+# 自动:
+#   - 关闭系统防火墙 (ufw / firewalld / iptables) 放行所有端口
+#   - 清理端口占用 (包括旧的 danted 残留)
+#   - 从 GitHub 官方 Release 下载 sing-box 最新版二进制
+#   - 写入 systemd service, 日志走 journald (不依赖 /var/log)
 #
-# 示例:
-#   bash socks5-deploy.sh -u admin -p MyPass123 -P 1080
-#   bash socks5-deploy.sh --user proxy --pass secret --port 10808 --listen 0.0.0.0
-#   curl -fsSL https://raw.githubusercontent.com/xxx/xxx/main/socks5-deploy.sh | bash -s -- -u admin -p pass123 -P 1080
+# ----------------------------------------------------------------------------
+# 使用
+# ----------------------------------------------------------------------------
+#   bash sk5.sh                                  # 默认 unlil/unlil/61080
+#   bash sk5.sh -u admin -p MyPass -P 1080       # 自定义
+#   curl -fsSL https://你的地址/sk5.sh | bash
+#   curl -fsSL https://你的地址/sk5.sh | bash -s -- -u admin -p MyPass -P 1080
+#   bash sk5.sh --uninstall                      # 卸载
+#
+# ----------------------------------------------------------------------------
+# 部署后管理
+# ----------------------------------------------------------------------------
+#   状态  systemctl status sing-box
+#   日志  journalctl -u sing-box -f
+#   重启  systemctl restart sing-box
+#   配置  /etc/sing-box/config.json
 #=============================================================================
 
 set -euo pipefail
 
 #=============================================================================
-# 默认值
+# 默认配置
 #=============================================================================
-SOCKS5_USER="proxy"
-SOCKS5_PASS=""
-SOCKS5_PORT=""
-LISTEN_ADDR="0.0.0.0"
-SINGBOX_VERSION=""
+SOCKS5_USER="unlil"
+SOCKS5_PASS="unlil"
+SOCKS5_PORT="61080"
 
-CONFIG_DIR="/etc/sbox_socks5"
+SERVICE_NAME="sing-box"
+BIN_PATH="/usr/local/bin/sing-box"
+CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
-SERVICE_NAME="sbox-socks5"
+SERVICE_FILE="/etc/systemd/system/sing-box.service"
+
+# Fallback 版本 (GitHub API 不通时使用)
+SINGBOX_FALLBACK_VER="1.10.7"
+
+ACTION="install"
 
 #=============================================================================
-# 颜色
+# 颜色 & 日志
 #=============================================================================
-red='\033[31m'; green='\033[32m'; yellow='\033[33m'
-cyan='\033[96m'; bai='\033[0m'
+C_RED='\033[31m'
+C_GREEN='\033[32m'
+C_YELLOW='\033[33m'
+C_CYAN='\033[96m'
+C_BOLD='\033[1m'
+C_RST='\033[0m'
 
-log_info()    { echo -e "${cyan}[INFO]${bai} $*"; }
-log_ok()      { echo -e "${green}[OK]${bai}   $*"; }
-log_warn()    { echo -e "${yellow}[WARN]${bai} $*"; }
-log_error()   { echo -e "${red}[ERR]${bai}  $*" >&2; }
-die()         { log_error "$*"; exit 1; }
+log_info() { echo -e "${C_CYAN}[INFO]${C_RST} $*"; }
+log_ok()   { echo -e "${C_GREEN}[ OK ]${C_RST} $*"; }
+log_warn() { echo -e "${C_YELLOW}[WARN]${C_RST} $*"; }
+log_err()  { echo -e "${C_RED}[ERR ]${C_RST} $*" >&2; }
+die()      { log_err "$*"; exit 1; }
 
 #=============================================================================
-# 帮助
+# 参数
 #=============================================================================
 usage() {
-    grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,1\}//'
+    cat <<EOF
+SOCKS5 一键部署脚本 (sing-box)
+
+用法:
+  bash $0 [选项]
+
+选项:
+  -u, --user USER    用户名 (默认: unlil)
+  -p, --pass PASS    密码   (默认: unlil)
+  -P, --port PORT    端口   (默认: 61080)
+      --uninstall    卸载 sing-box
+  -h, --help         显示帮助
+EOF
     exit 0
 }
 
-#=============================================================================
-# 解析参数
-#=============================================================================
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -u|--user)    SOCKS5_USER="$2";    shift 2 ;;
-            -p|--pass)    SOCKS5_PASS="$2";    shift 2 ;;
-            -P|--port)    SOCKS5_PORT="$2";    shift 2 ;;
-            -l|--listen)  LISTEN_ADDR="$2";    shift 2 ;;
-            -v|--version) SINGBOX_VERSION="$2"; shift 2 ;;
+            -u|--user)    SOCKS5_USER="${2:-}"; shift 2 ;;
+            -p|--pass)    SOCKS5_PASS="${2:-}"; shift 2 ;;
+            -P|--port)    SOCKS5_PORT="${2:-}"; shift 2 ;;
+            --uninstall)  ACTION="uninstall"; shift ;;
             -h|--help)    usage ;;
-            *) log_warn "未知参数: $1"; shift ;;
+            *) log_warn "忽略未知参数: $1"; shift ;;
         esac
     done
 }
 
 #=============================================================================
-# 校验
+# 基础检查
 #=============================================================================
-validate_args() {
-    # 用户名
-    [[ -z "$SOCKS5_USER" ]] && die "用户名不能为空"
-    [[ "$SOCKS5_USER" =~ ^[a-zA-Z0-9_-]+$ ]] || die "用户名只能含字母/数字/下划线/连字符"
+check_system() {
+    [[ "$(id -u)" -eq 0 ]] || die "请使用 root 权限运行 (sudo -i)"
+    command -v apt-get &>/dev/null || die "此脚本仅支持 Debian / Ubuntu"
 
-    # 密码：未指定则随机生成
-    if [[ -z "$SOCKS5_PASS" ]]; then
-        SOCKS5_PASS=$(tr -dc 'A-Za-z0-9!@#%^&*' < /dev/urandom | head -c 16)
-        log_info "随机密码: ${SOCKS5_PASS}"
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        log_info "系统: ${PRETTY_NAME:-unknown}"
     fi
-    [[ ${#SOCKS5_PASS} -lt 6 ]] && die "密码至少6位"
-
-    # 端口：未指定则随机生成
-    if [[ -z "$SOCKS5_PORT" ]]; then
-        SOCKS5_PORT=$(( ((RANDOM<<15)|RANDOM) % 55536 + 10000 ))
-        log_info "随机端口: ${SOCKS5_PORT}"
-    fi
-    [[ "$SOCKS5_PORT" =~ ^[0-9]+$ ]] && [ "$SOCKS5_PORT" -ge 1024 ] && [ "$SOCKS5_PORT" -le 65535 ] \
-        || die "端口范围: 1024-65535"
-    ss -tulpn 2>/dev/null | grep -q ":${SOCKS5_PORT} " && die "端口 ${SOCKS5_PORT} 已被占用"
-
-    # 监听地址
-    [[ "$LISTEN_ADDR" == "0.0.0.0" || "$LISTEN_ADDR" == "::" ]] \
-        || die "监听地址只支持 0.0.0.0 或 ::"
 }
 
-#=============================================================================
-# 检查 root
-#=============================================================================
-check_root() {
-    [[ "$(id -u)" -eq 0 ]] || die "需要 root 权限，请使用 sudo 或以 root 执行"
+validate_params() {
+    [[ -n "$SOCKS5_USER" ]] || die "用户名不能为空"
+    [[ -n "$SOCKS5_PASS" ]] || die "密码不能为空"
+    [[ "$SOCKS5_PORT" =~ ^[0-9]+$ ]] && (( SOCKS5_PORT >= 1 && SOCKS5_PORT <= 65535 )) \
+        || die "端口范围 1-65535"
 }
 
-#=============================================================================
-# 获取系统架构
-#=============================================================================
-get_arch() {
+ensure_deps() {
+    local need=()
+    command -v curl  &>/dev/null || need+=(curl)
+    command -v tar   &>/dev/null || need+=(tar)
+    command -v ss    &>/dev/null || need+=(iproute2)
+    if (( ${#need[@]} > 0 )); then
+        log_info "安装依赖: ${need[*]}"
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${need[@]}" \
+            || die "依赖安装失败: ${need[*]}"
+    fi
+}
+
+detect_arch() {
     case "$(uname -m)" in
         x86_64|amd64)   echo "amd64" ;;
         aarch64|arm64)  echo "arm64" ;;
-        armv7l)         echo "armv7" ;;
-        s390x)          echo "s390x" ;;
+        armv7*|armv7l)  echo "armv7" ;;
+        armv6*)         echo "armv6" ;;
         *) die "不支持的架构: $(uname -m)" ;;
     esac
 }
 
 #=============================================================================
-# 检测已安装的 sing-box
+# 关闭系统防火墙 + 放行所有端口
 #=============================================================================
-find_singbox() {
-    for p in /etc/sing-box/sing-box /usr/local/bin/sing-box /opt/sing-box/sing-box; do
-        [[ -x "$p" ]] && echo "$p" && return 0
-    done
-    command -v sing-box &>/dev/null && which sing-box && return 0
-    return 1
+disable_firewall() {
+    log_info "关闭系统防火墙，放行所有端口..."
+
+    if command -v ufw &>/dev/null; then
+        ufw --force disable >/dev/null 2>&1 || true
+        log_ok "已禁用 ufw"
+    fi
+
+    if systemctl list-unit-files 2>/dev/null | grep -q '^firewalld'; then
+        systemctl stop firewalld >/dev/null 2>&1 || true
+        systemctl disable firewalld >/dev/null 2>&1 || true
+        log_ok "已禁用 firewalld"
+    fi
+
+    if command -v iptables &>/dev/null; then
+        iptables -P INPUT   ACCEPT 2>/dev/null || true
+        iptables -P FORWARD ACCEPT 2>/dev/null || true
+        iptables -P OUTPUT  ACCEPT 2>/dev/null || true
+        iptables -F 2>/dev/null || true
+        iptables -X 2>/dev/null || true
+        iptables -Z 2>/dev/null || true
+        iptables -t nat    -F 2>/dev/null || true
+        iptables -t nat    -X 2>/dev/null || true
+        iptables -t mangle -F 2>/dev/null || true
+        iptables -t mangle -X 2>/dev/null || true
+        log_ok "iptables 规则已清空 (全部 ACCEPT)"
+    fi
+
+    if command -v ip6tables &>/dev/null; then
+        ip6tables -P INPUT   ACCEPT 2>/dev/null || true
+        ip6tables -P FORWARD ACCEPT 2>/dev/null || true
+        ip6tables -P OUTPUT  ACCEPT 2>/dev/null || true
+        ip6tables -F 2>/dev/null || true
+        ip6tables -X 2>/dev/null || true
+    fi
+
+    if systemctl list-unit-files 2>/dev/null | grep -q '^netfilter-persistent'; then
+        systemctl stop netfilter-persistent >/dev/null 2>&1 || true
+        systemctl disable netfilter-persistent >/dev/null 2>&1 || true
+    fi
 }
 
 #=============================================================================
-# 安装 sing-box
+# 清理冲突: 旧 danted + 端口占用
 #=============================================================================
+cleanup_conflicts() {
+    log_info "清理可能的冲突服务与端口占用..."
+
+    # 旧 danted 残留
+    if systemctl list-unit-files 2>/dev/null | grep -q '^danted'; then
+        systemctl stop danted    >/dev/null 2>&1 || true
+        systemctl disable danted >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq dante-server >/dev/null 2>&1 || true
+        rm -f /etc/danted.conf
+        log_ok "已卸载旧 danted"
+    fi
+
+    # 停止自身，避免热重启端口占用
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+
+    # 杀掉仍占用目标端口的进程
+    local pids
+    pids="$(ss -H -tlnp 2>/dev/null | awk -v p=":${SOCKS5_PORT}" '$4 ~ p {print $0}' \
+        | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)"
+    if [[ -n "$pids" ]]; then
+        log_warn "端口 ${SOCKS5_PORT} 被进程 ${pids//$'\n'/ } 占用，强制终止"
+        for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
+    fi
+}
+
+#=============================================================================
+# 下载 & 安装 sing-box
+#=============================================================================
+get_latest_version() {
+    local v
+    v="$(curl -fsSL --max-time 10 \
+        https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null \
+        | grep -oE '"tag_name":[[:space:]]*"v[^"]+"' \
+        | head -1 | sed -E 's/.*"v([^"]+)".*/\1/')"
+    if [[ -z "$v" ]]; then
+        log_warn "GitHub API 获取版本失败, 使用 fallback: ${SINGBOX_FALLBACK_VER}"
+        v="$SINGBOX_FALLBACK_VER"
+    fi
+    echo "$v"
+}
+
 install_singbox() {
-    local arch; arch=$(get_arch)
+    local arch ver pkg url tmp
+    arch="$(detect_arch)"
+    ver="$(get_latest_version)"
+    pkg="sing-box-${ver}-linux-${arch}"
+    url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/${pkg}.tar.gz"
 
-    if [[ -z "$SINGBOX_VERSION" ]]; then
-        log_info "获取最新版本..."
-        SINGBOX_VERSION=$(curl -fsSL --max-time 10 \
-            "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
-            | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/' | head -1)
-        [[ -z "$SINGBOX_VERSION" ]] && SINGBOX_VERSION="1.11.0"
-        log_info "版本: v${SINGBOX_VERSION}"
+    log_info "下载 sing-box v${ver} (${arch})..."
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+
+    # 主地址失败时尝试 ghproxy 镜像
+    if ! curl -fsSL --max-time 60 "$url" -o "$tmp/sb.tar.gz"; then
+        log_warn "GitHub 直连失败，尝试镜像..."
+        curl -fsSL --max-time 90 "https://ghfast.top/${url}" -o "$tmp/sb.tar.gz" \
+            || curl -fsSL --max-time 90 "https://mirror.ghproxy.com/${url}" -o "$tmp/sb.tar.gz" \
+            || die "sing-box 下载失败，请检查网络"
     fi
 
-    local url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${arch}.tar.gz"
-    local tmp="/tmp/singbox-$$.tar.gz"
+    tar -xzf "$tmp/sb.tar.gz" -C "$tmp" || die "解压失败"
+    [[ -f "$tmp/${pkg}/sing-box" ]] || die "压缩包内未找到 sing-box 二进制"
 
-    log_info "下载 sing-box v${SINGBOX_VERSION} (${arch})..."
-    curl -fsSL --max-time 60 -o "$tmp" "$url" || wget -q --timeout=60 -O "$tmp" "$url" \
-        || die "下载失败: $url"
-
-    mkdir -p /etc/sing-box
-    tar -xzf "$tmp" -C /tmp/ 2>/dev/null
-    local bin; bin=$(find /tmp -name "sing-box" -type f 2>/dev/null | grep -v ".tar" | head -1)
-    [[ -z "$bin" ]] && die "解压后未找到 sing-box 二进制"
-    mv "$bin" /etc/sing-box/sing-box
-    chmod +x /etc/sing-box/sing-box
-    rm -f "$tmp"
-
-    /etc/sing-box/sing-box version >/dev/null 2>&1 || die "sing-box 安装验证失败"
-    log_ok "sing-box 安装成功"
+    install -m 0755 "$tmp/${pkg}/sing-box" "$BIN_PATH"
+    log_ok "$("$BIN_PATH" version | head -1)"
 }
 
 #=============================================================================
-# 部署
+# 配置文件 + systemd service
 #=============================================================================
-deploy() {
-    local SINGBOX_BIN
-
-    # 检测或安装 sing-box
-    log_info "检测 sing-box..."
-    if SINGBOX_BIN=$(find_singbox); then
-        log_ok "已找到: $SINGBOX_BIN"
-    else
-        log_info "未找到 sing-box，开始安装..."
-        install_singbox
-        SINGBOX_BIN="/etc/sing-box/sing-box"
-    fi
-
-    # 创建配置目录
+write_config() {
     mkdir -p "$CONFIG_DIR"
-    chmod 700 "$CONFIG_DIR"
-
-    # 写入配置
-    log_info "写入配置..."
-    cat > "$CONFIG_FILE" << EOF
+    log_info "写入配置 ${CONFIG_FILE}..."
+    cat > "$CONFIG_FILE" <<EOF
 {
   "log": {
-    "level": "warn",
-    "output": "${CONFIG_DIR}/socks5.log"
+    "level": "info",
+    "timestamp": true
   },
   "inbounds": [
     {
       "type": "socks",
-      "tag": "socks5-in",
-      "listen": "${LISTEN_ADDR}",
+      "tag": "socks-in",
+      "listen": "0.0.0.0",
       "listen_port": ${SOCKS5_PORT},
       "users": [
         {
@@ -214,89 +288,138 @@ deploy() {
   ]
 }
 EOF
-    chmod 600 "$CONFIG_FILE"
 
-    # 验证配置
-    log_info "验证配置..."
-    $SINGBOX_BIN check -c "$CONFIG_FILE" >/dev/null 2>&1 \
-        || { $SINGBOX_BIN check -c "$CONFIG_FILE"; die "配置验证失败"; }
-    log_ok "配置验证通过"
+    # 配置语法校验
+    if ! "$BIN_PATH" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+        log_err "sing-box 配置校验失败:"
+        "$BIN_PATH" check -c "$CONFIG_FILE" || true
+        exit 1
+    fi
+    log_ok "配置校验通过"
+}
 
-    # 创建 systemd 服务
-    log_info "创建 systemd 服务..."
-    cat > "/etc/systemd/system/${SERVICE_NAME}.service" << EOF
+write_service() {
+    log_info "写入 systemd service..."
+    cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Sing-box SOCKS5 Proxy
-After=network.target
+Description=sing-box proxy service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
 
 [Service]
 Type=simple
-ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE}
-Restart=always
-RestartSec=5
+User=root
+ExecStart=${BIN_PATH} run -c ${CONFIG_FILE}
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=5s
 LimitNOFILE=1048576
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOF
+}
 
+start_service() {
+    log_info "启动 ${SERVICE_NAME} 服务..."
     systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
     systemctl restart "$SERVICE_NAME"
     sleep 2
 
-    # 验证运行
-    systemctl is-active --quiet "$SERVICE_NAME" || {
-        log_error "服务启动失败，日志："
-        journalctl -u "$SERVICE_NAME" -n 20 --no-pager
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        log_ok "服务运行正常"
+    else
+        log_err "服务启动失败，最近日志:"
+        journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
         exit 1
-    }
-
-    log_ok "服务已启动"
-}
-
-#=============================================================================
-# 获取公网 IP
-#=============================================================================
-get_public_ip() {
-    local ip
-    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]') && [[ -n "$ip" ]] && echo "$ip" && return
-    done
-    echo "YOUR_SERVER_IP"
+    fi
 }
 
 #=============================================================================
 # 输出结果
 #=============================================================================
+get_public_ip() {
+    local ip
+    for url in "https://api.ipify.org" "https://ifconfig.me" "https://checkip.amazonaws.com"; do
+        ip="$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')"
+        [[ -n "$ip" && "$ip" =~ ^[0-9a-fA-F\.\:]+$ ]] && { echo "$ip"; return; }
+    done
+    echo "YOUR_SERVER_IP"
+}
+
 print_result() {
-    local ip; ip=$(get_public_ip)
+    local ip; ip="$(get_public_ip)"
     echo ""
-    echo -e "${green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${bai}"
-    echo -e "${green} 🎉 SOCKS5 部署成功！${bai}"
-    echo -e "${green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${bai}"
-    printf "  %-8s %s\n" "服务器:" "$ip"
-    printf "  %-8s %s\n" "端口:"   "$SOCKS5_PORT"
-    printf "  %-8s %s\n" "用户名:" "$SOCKS5_USER"
-    printf "  %-8s %s\n" "密码:"   "$SOCKS5_PASS"
-    printf "  %-8s %s\n" "协议:"   "SOCKS5"
+    echo -e "${C_GREEN}========================================${C_RST}"
+    echo -e "${C_GREEN}${C_BOLD}      SOCKS5 部署成功 (sing-box)${C_RST}"
+    echo -e "${C_GREEN}========================================${C_RST}"
+    printf "  %-10s ${C_YELLOW}%s${C_RST}\n" "服务器 IP:" "$ip"
+    printf "  %-10s ${C_YELLOW}%s${C_RST}\n" "端口:"      "$SOCKS5_PORT"
+    printf "  %-10s ${C_YELLOW}%s${C_RST}\n" "用户名:"    "$SOCKS5_USER"
+    printf "  %-10s ${C_YELLOW}%s${C_RST}\n" "密码:"      "$SOCKS5_PASS"
     echo ""
-    echo -e "  ${cyan}URL: socks5://${SOCKS5_USER}:${SOCKS5_PASS}@${ip}:${SOCKS5_PORT}${bai}"
+    echo -e "  连接串: ${C_CYAN}socks5://${SOCKS5_USER}:${SOCKS5_PASS}@${ip}:${SOCKS5_PORT}${C_RST}"
     echo ""
-    echo -e "  验证: curl --socks5-hostname ${SOCKS5_USER}:${SOCKS5_PASS}@${ip}:${SOCKS5_PORT} https://ip.sb"
-    echo -e "${green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${bai}"
+    echo -e "  测试: curl --socks5-hostname ${SOCKS5_USER}:${SOCKS5_PASS}@${ip}:${SOCKS5_PORT} https://ip.sb"
+    echo -e "${C_GREEN}========================================${C_RST}"
+    echo ""
+    echo -e "  管理:"
+    echo -e "    状态  systemctl status ${SERVICE_NAME}"
+    echo -e "    日志  journalctl -u ${SERVICE_NAME} -f"
+    echo -e "    重启  systemctl restart ${SERVICE_NAME}"
+    echo -e "    配置  ${CONFIG_FILE}"
     echo ""
 }
 
 #=============================================================================
-# 主流程
+# 卸载
 #=============================================================================
+do_uninstall() {
+    log_info "卸载 sing-box..."
+    systemctl stop    "$SERVICE_NAME" 2>/dev/null || true
+    systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+    rm -f "$SERVICE_FILE"
+    systemctl daemon-reload
+    rm -f "$BIN_PATH"
+    rm -rf "$CONFIG_DIR"
+    log_ok "sing-box 已完全卸载"
+    echo ""
+}
+
+#=============================================================================
+# 入口
+#=============================================================================
+do_install() {
+    validate_params
+    echo ""
+    echo -e "${C_BOLD}${C_CYAN}=== SOCKS5 一键部署 (sing-box) ===${C_RST}"
+    echo -e "  用户名: ${C_YELLOW}${SOCKS5_USER}${C_RST}"
+    echo -e "  密码:   ${C_YELLOW}${SOCKS5_PASS}${C_RST}"
+    echo -e "  端口:   ${C_YELLOW}${SOCKS5_PORT}${C_RST}"
+    echo ""
+
+    ensure_deps
+    disable_firewall
+    cleanup_conflicts
+    install_singbox
+    write_config
+    write_service
+    start_service
+    print_result
+}
+
 main() {
     parse_args "$@"
-    check_root
-    validate_args
-    deploy
-    print_result
+    check_system
+
+    case "$ACTION" in
+        install)   do_install ;;
+        uninstall) do_uninstall ;;
+        *) die "未知动作: $ACTION" ;;
+    esac
 }
 
 main "$@"
