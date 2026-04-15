@@ -1,7 +1,6 @@
 #!/bin/bash
 # ============================================================
-# 专线网络优化工具 v3.1-yt (YouTube秒开优化版)
-# 功能: BBR/sysctl优化 + initcwnd秒开 + 链路向导 + 国家白名单 + 端口监控
+# 专线网络优化工具 v3
 # 优化: 大缓冲/强突发/低延迟/高兼容
 # 用法: sudo bash network-optimizer.sh [命令]
 # ============================================================
@@ -314,32 +313,38 @@ apply_sysctl_config() {
 }
 
 # ==================== 一键最大性能 ====================
+speedtest_probe() {
+    # 下载测速: 多源探测取最大值, 返回 Mbps
+    local max_mbps=0
+    local urls=(
+        "http://cachefly.cachefly.net/10mb.test"
+        "http://speedtest.tele2.net/10MB.zip"
+        "http://proof.ovh.net/files/10Mb.dat"
+    )
+    for url in "${urls[@]}"; do
+        # curl: 下载10MB, 限时15秒, 取平均速度(字节/秒)
+        local speed=$(curl -so /dev/null -w '%{speed_download}' --connect-timeout 5 --max-time 15 "$url" 2>/dev/null)
+        if [ -n "$speed" ]; then
+            # speed_download 是浮点字节/秒, 转Mbps: *8/1000000
+            local mbps=$(awk "BEGIN{v=$speed*8/1000000; printf \"%.0f\",v}" 2>/dev/null)
+            [ -n "$mbps" ] && [ "$mbps" -gt "$max_mbps" ] 2>/dev/null && max_mbps=$mbps
+        fi
+    done
+    echo "$max_mbps"
+}
+
 auto_max_performance() {
     echo ""; echo -e "  ${BOLD}${CYAN}━━━ 一键最大性能 ━━━${NC}"; echo ""
-    echo -e "  ${DIM}自动检测硬件，跳过向导直接拉满${NC}"; echo ""
+    echo -e "  ${DIM}自动检测: 带宽测速 + 延迟探测 + 内存评估${NC}"; echo ""
 
-    # 检测网卡速率
     local iface=$(detect_interface)
-    local link_speed=1000
-    if [ -n "$iface" ]; then
-        # 优先 ethtool
-        if command -v ethtool >/dev/null 2>&1; then
-            local es=$(ethtool "$iface" 2>/dev/null | awk '/Speed:/{gsub(/[^0-9]/,"",$2);print $2}')
-            [ -n "$es" ] && [ "$es" -gt 0 ] 2>/dev/null && link_speed=$es
-        fi
-        # 回退 /sys
-        if [ "$link_speed" -le 0 ] 2>/dev/null || [ "$link_speed" = "1000" ]; then
-            local sf="/sys/class/net/${iface}/speed"
-            [ -r "$sf" ] && { local sv=$(cat "$sf" 2>/dev/null); [ -n "$sv" ] && [ "$sv" -gt 0 ] 2>/dev/null && link_speed=$sv; }
-        fi
-    fi
-    echo -e "  ${WHITE}网卡:${NC}  ${BOLD}${iface:-unknown}${NC} @ ${BOLD}${link_speed}Mbps${NC}"
+    echo -e "  ${WHITE}网卡:${NC}  ${BOLD}${iface:-unknown}${NC}"
 
     # 检测内存
     get_meminfo
     echo -e "  ${WHITE}内存:${NC}  ${BOLD}$(( MEM_TOTAL_KB / 1024 ))MB${NC} + Swap ${BOLD}$(( SWAP_TOTAL_KB / 1024 ))MB${NC}"
 
-    # 探测延迟 (ping Google/Cloudflare/YouTube 取最小值作为基准)
+    # 探测延迟
     local best_rtt=200
     echo -ne "  ${WHITE}延迟:${NC}  探测中..."
     for target in 8.8.8.8 1.1.1.1 142.250.80.46; do
@@ -349,22 +354,42 @@ auto_max_performance() {
             [ $rtt_val -lt $best_rtt ] && best_rtt=$rtt_val
         fi
     done
-    # 最低RTT保底20ms
     [ $best_rtt -lt 20 ] && best_rtt=20
-    echo -e "\r  ${WHITE}延迟:${NC}  ${BOLD}RTT ${best_rtt}ms${NC} (自动探测)        "
+    echo -e "\r  ${WHITE}延迟:${NC}  ${BOLD}RTT ${best_rtt}ms${NC}                    "
 
-    # 带宽取网卡速率 (VPS一般端口速率=实际可用)
-    local bw=$link_speed
+    # 真实带宽测速
+    echo -ne "  ${WHITE}带宽:${NC}  测速中 (下载10MB测试文件)..."
+    local bw=$(speedtest_probe)
+    if [ "$bw" -gt 0 ] 2>/dev/null; then
+        echo -e "\r  ${WHITE}带宽:${NC}  ${BOLD}${bw}Mbps${NC} (实测)                       "
+    else
+        # 测速失败回退: 读网卡速率再打折
+        local link_speed=100
+        if [ -n "$iface" ]; then
+            if command -v ethtool >/dev/null 2>&1; then
+                local es=$(ethtool "$iface" 2>/dev/null | awk '/Speed:/{gsub(/[^0-9]/,"",$2);print $2}')
+                [ -n "$es" ] && [ "$es" -gt 0 ] 2>/dev/null && link_speed=$es
+            fi
+            if [ "$link_speed" = "1000" ] || [ "$link_speed" -le 0 ] 2>/dev/null; then
+                local sf="/sys/class/net/${iface}/speed"
+                [ -r "$sf" ] && { local sv=$(cat "$sf" 2>/dev/null); [ -n "$sv" ] && [ "$sv" -gt 0 ] 2>/dev/null && link_speed=$sv; }
+            fi
+        fi
+        # 网卡速率不等于实际带宽，保守取1/10
+        bw=$(( link_speed / 10 ))
+        [ $bw -lt 10 ] && bw=10
+        echo -e "\r  ${WHITE}带宽:${NC}  ${BOLD}${bw}Mbps${NC} ${YELLOW}(测速失败,估算值)${NC}          "
+    fi
 
-    # 显示计算结果
+    # BDP
     local bdp=$(( bw * best_rtt * 125 ))
     echo -e "  ${WHITE}BDP:${NC}   ${BOLD}$(( bdp / 1024 ))KB${NC} (${bw}Mbps × ${best_rtt}ms)"
     echo ""
 
     local h="# 角色: 一键最大性能 (自动检测)
-# 网卡: ${iface:-unknown} @ ${link_speed}Mbps
+# 网卡: ${iface:-unknown} | 实测带宽: ${bw}Mbps
 # 内存: $(( MEM_TOTAL_KB / 1024 ))MB + Swap $(( SWAP_TOTAL_KB / 1024 ))MB
-# RTT: ${best_rtt}ms (自动探测) | BDP: $(( bdp / 1024 ))KB"
+# RTT: ${best_rtt}ms (探测) | BDP: $(( bdp / 1024 ))KB"
 
     apply_sysctl_config "极速 (${bw}Mbps×${best_rtt}ms)" \
         "$(calculate_and_generate "极速 (${bw}Mbps×${best_rtt}ms)" "$bw" "$best_rtt" "$bw" "$best_rtt" "$h")"
