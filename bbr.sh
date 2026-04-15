@@ -298,43 +298,44 @@ apply_sysctl_config() {
             echo -e "  ${RED}⚠ 内核不支持BBR (需>=4.9, 当前$(uname -r))${NC}"
     fi
     check_memory_and_swap
-    init_config_dir
-    echo "$config" > "$SYSCTL_CONF"
-    echo "SYSCTL_PROFILE_NAME=\"$role_name\"" > "$PROFILE_CONF"
-    [ ! -f "$CONFIG_DIR/sysctl-backup.conf" ] && { sysctl -a > "$CONFIG_DIR/sysctl-backup.conf" 2>/dev/null; echo -e "  ${GREEN}✓${NC} 已备份"; }
-    ln -sf "$SYSCTL_CONF" /etc/sysctl.d/99-network-optimize.conf
-    echo -e "  ${GREEN}✓${NC} 配置已写入"
-    if confirm_action "立即应用?"; then
+
+    if confirm_action "确认写入并应用?"; then
+        init_config_dir
+        [ ! -f "$CONFIG_DIR/sysctl-backup.conf" ] && { sysctl -a > "$CONFIG_DIR/sysctl-backup.conf" 2>/dev/null; echo -e "  ${GREEN}✓${NC} 已备份"; }
+        echo "$config" > "$SYSCTL_CONF"
+        echo "SYSCTL_PROFILE_NAME=\"$role_name\"" > "$PROFILE_CONF"
+        ln -sf "$SYSCTL_CONF" /etc/sysctl.d/99-network-optimize.conf
         local err=$(sysctl --system 2>&1 | grep -i "error\|cannot\|invalid" || true)
         [ -n "$err" ] && echo "$err" | head -3 | sed 's/^/    /'
         apply_initcwnd
         echo -e "  ${GREEN}✓${NC} 已生效 | $(sysctl -n net.ipv4.tcp_congestion_control) + $(sysctl -n net.core.default_qdisc)"
-    else echo -e "  ${DIM}已保存，sysctl --system 生效${NC}"; fi
+    else
+        echo -e "  ${DIM}已取消，未写入任何配置${NC}"
+    fi
     echo ""
 }
 
 # ==================== 一键最大性能 ====================
 speedtest_probe() {
-    # 分级测速: 先10MB快速探测, 高带宽追加100MB精确测
-    local max_mbps=0
+    # 固定3轮测速: 100MB×1 + 10MB×2, 取最大值
+    local max_mbps=0 round=0
 
     _test_url() {
         local url="$1" label="$2" timeout="$3"
-        echo -ne "\r  ${WHITE}带宽:${NC}  ${DIM}${label}...${NC}                              " >&2
+        round=$(( round + 1 ))
+        echo -ne "\r  ${WHITE}带宽:${NC}  ${DIM}[${round}/3] ${label}...${NC}                              " >&2
         local speed=$(curl -so /dev/null -w '%{speed_download}' --connect-timeout 5 --max-time "$timeout" "$url" 2>/dev/null)
         [ -z "$speed" ] && return
         local mbps=$(awk "BEGIN{v=$speed*8/1000000; printf \"%.0f\",v}" 2>/dev/null)
         [ -n "$mbps" ] && [ "$mbps" -gt "$max_mbps" ] 2>/dev/null && max_mbps=$mbps
     }
 
-    # 第一轮: 10MB快速测 (Cloudflare + Google)
+    # 第1轮: Cloudflare 100MB (大文件测峰值)
+    _test_url "https://speed.cloudflare.com/__down?bytes=100000000" "Cloudflare 100MB" 30
+    # 第2轮: Google CDN 10MB
+    _test_url "http://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" "Google CDN 10MB" 10
+    # 第3轮: Cloudflare 10MB (补测取稳定值)
     _test_url "https://speed.cloudflare.com/__down?bytes=10000000" "Cloudflare 10MB" 15
-    _test_url "http://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" "Google CDN" 10
-
-    # 高带宽追加: >80Mbps说明10MB不到2秒就下完了，精度不够，用大文件再测
-    if [ "$max_mbps" -gt 80 ] 2>/dev/null; then
-        _test_url "https://speed.cloudflare.com/__down?bytes=100000000" "Cloudflare 100MB" 20
-    fi
 
     echo "$max_mbps"
 }
@@ -392,13 +393,33 @@ auto_max_performance() {
     echo -e "  ${WHITE}BDP:${NC}   ${BOLD}$(( bdp / 1024 ))KB${NC} (${bw}Mbps × ${best_rtt}ms)"
     echo ""
 
-    local h="# 角色: 一键最大性能 (自动检测)
+    # 确认测速结果
+    if ! confirm_action "使用此结果生成配置?"; then
+        echo -e "  ${DIM}已取消${NC}"
+        return
+    fi
+
+    # 选择服务器角色
+    echo ""
+    echo -e "  ${DIM}用户 → ①前置 → ②IX → ③转发 → ④落地 → 目标${NC}"; echo ""
+    select_menu "本机角色" "① 前置服务器 (用户直连入口)" "② IX专线服务器 (上下游中转)" "③ 转发/线路服务器 (国际线路)" "④ 落地服务器 (出口访问目标)" "⑤ 通用 (不区分角色)"
+    local role_idx=$?
+    local role_name role_label
+    case $role_idx in
+        0) role_name="前置"; role_label="前置服务器 (用户直连入口)";;
+        1) role_name="IX专线"; role_label="IX专线服务器 (上下游中转)";;
+        2) role_name="转发"; role_label="转发/线路服务器 (国际线路)";;
+        3) role_name="落地"; role_label="落地服务器 (出口访问目标)";;
+        *) role_name="通用"; role_label="通用极速模式";;
+    esac
+
+    local h="# 角色: ${role_label} (自动检测)
 # 网卡: ${iface:-unknown} | 实测带宽: ${bw}Mbps
 # 内存: $(( MEM_TOTAL_KB / 1024 ))MB + Swap $(( SWAP_TOTAL_KB / 1024 ))MB
 # RTT: ${best_rtt}ms (探测) | BDP: $(( bdp / 1024 ))KB"
 
-    apply_sysctl_config "极速 (${bw}Mbps×${best_rtt}ms)" \
-        "$(calculate_and_generate "极速 (${bw}Mbps×${best_rtt}ms)" "$bw" "$best_rtt" "$bw" "$best_rtt" "$h")"
+    apply_sysctl_config "${role_name} (${bw}Mbps×${best_rtt}ms)" \
+        "$(calculate_and_generate "${role_name} (${bw}Mbps×${best_rtt}ms)" "$bw" "$best_rtt" "$bw" "$best_rtt" "$h")"
 }
 
 # ==================== 链路向导 ====================
@@ -695,7 +716,7 @@ interactive_main() {
         nft list table inet geo_filter >/dev/null 2>&1 && { [ -f "$GEO_CONF" ] && source "$GEO_CONF"; echo -e "  ${GREEN}●${NC} 白名单: ${WHITE}${GEO_COUNTRIES:-启用}${NC}"; } || echo -e "  ${DIM}○ 白名单: 未启用${NC}"
         local al="安装自启"; systemctl is-enabled network-optimizer.service >/dev/null 2>&1 && { echo -e "  ${GREEN}●${NC} 自启: 启用"; al="关闭自启"; } || echo -e "  ${DIM}○ 自启: 未启用${NC}"
         get_meminfo; echo -e "  ${DIM}内存$(( MEM_TOTAL_KB/1024 ))M Swap$(( SWAP_TOTAL_KB/1024 ))M${NC}"; echo ""
-        select_menu "操作" "⚡ 一键最大性能" "BBR链路向导" "白名单" "状态" "端口监控" "刷新配置" "$al" "恢复默认" "退出"
+        select_menu "操作" "⚡ 一键自动配置" "手动链路向导" "白名单" "状态" "端口监控" "刷新配置" "$al" "恢复默认" "退出"
         case $? in 0) auto_max_performance;; 1) wizard_main;; 2) geo_main;continue;; 3) show_status;; 4) port_monitor;continue;; 5) reload_network;; 6) toggle_service;; 7) restore_defaults;; 8) rst;exit 0;; esac
         echo -ne "  ${DIM}回车返回...${NC}"; read -r
     done
