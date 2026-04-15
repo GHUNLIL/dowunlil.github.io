@@ -1,6 +1,7 @@
 #!/bin/bash
 # ============================================================
-# 专线网络优化工具 v3
+# 专线网络优化工具 v3.1-yt (YouTube秒开优化版)
+# 功能: BBR/sysctl优化 + initcwnd秒开 + 链路向导 + 国家白名单 + 端口监控
 # 优化: 大缓冲/强突发/低延迟/高兼容
 # 用法: sudo bash network-optimizer.sh [命令]
 # ============================================================
@@ -314,22 +315,27 @@ apply_sysctl_config() {
 
 # ==================== 一键最大性能 ====================
 speedtest_probe() {
-    # 下载测速: 多源探测取最大值, 返回 Mbps
+    # 分级测速: 先10MB快速探测, 高带宽追加100MB精确测
     local max_mbps=0
-    local urls=(
-        "http://cachefly.cachefly.net/10mb.test"
-        "http://speedtest.tele2.net/10MB.zip"
-        "http://proof.ovh.net/files/10Mb.dat"
-    )
-    for url in "${urls[@]}"; do
-        # curl: 下载10MB, 限时15秒, 取平均速度(字节/秒)
-        local speed=$(curl -so /dev/null -w '%{speed_download}' --connect-timeout 5 --max-time 15 "$url" 2>/dev/null)
-        if [ -n "$speed" ]; then
-            # speed_download 是浮点字节/秒, 转Mbps: *8/1000000
-            local mbps=$(awk "BEGIN{v=$speed*8/1000000; printf \"%.0f\",v}" 2>/dev/null)
-            [ -n "$mbps" ] && [ "$mbps" -gt "$max_mbps" ] 2>/dev/null && max_mbps=$mbps
-        fi
-    done
+
+    _test_url() {
+        local url="$1" label="$2" timeout="$3"
+        echo -ne "\r  ${WHITE}带宽:${NC}  ${DIM}${label}...${NC}                              " >&2
+        local speed=$(curl -so /dev/null -w '%{speed_download}' --connect-timeout 5 --max-time "$timeout" "$url" 2>/dev/null)
+        [ -z "$speed" ] && return
+        local mbps=$(awk "BEGIN{v=$speed*8/1000000; printf \"%.0f\",v}" 2>/dev/null)
+        [ -n "$mbps" ] && [ "$mbps" -gt "$max_mbps" ] 2>/dev/null && max_mbps=$mbps
+    }
+
+    # 第一轮: 10MB快速测 (Cloudflare + Google)
+    _test_url "https://speed.cloudflare.com/__down?bytes=10000000" "Cloudflare 10MB" 15
+    _test_url "http://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" "Google CDN" 10
+
+    # 高带宽追加: >80Mbps说明10MB不到2秒就下完了，精度不够，用大文件再测
+    if [ "$max_mbps" -gt 80 ] 2>/dev/null; then
+        _test_url "https://speed.cloudflare.com/__down?bytes=100000000" "Cloudflare 100MB" 20
+    fi
+
     echo "$max_mbps"
 }
 
@@ -357,11 +363,11 @@ auto_max_performance() {
     [ $best_rtt -lt 20 ] && best_rtt=20
     echo -e "\r  ${WHITE}延迟:${NC}  ${BOLD}RTT ${best_rtt}ms${NC}                    "
 
-    # 真实带宽测速
-    echo -ne "  ${WHITE}带宽:${NC}  测速中 (下载10MB测试文件)..."
+    # 真实带宽测速 (Cloudflare + Google CDN)
+    echo -ne "  ${WHITE}带宽:${NC}  测速中..."
     local bw=$(speedtest_probe)
     if [ "$bw" -gt 0 ] 2>/dev/null; then
-        echo -e "\r  ${WHITE}带宽:${NC}  ${BOLD}${bw}Mbps${NC} (实测)                       "
+        echo -e "\r  ${WHITE}带宽:${NC}  ${BOLD}${bw}Mbps${NC} (Cloudflare/Google实测)         "
     else
         # 测速失败回退: 读网卡速率再打折
         local link_speed=100
