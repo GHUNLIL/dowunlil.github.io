@@ -315,43 +315,115 @@ apply_sysctl_config() {
     echo ""
 }
 
-# ==================== 一键最大性能 ====================
+# ==================== 一键自动配置 ====================
+
+# 临时应用极限参数(仅内存，不落盘)，让测速不被默认小缓冲卡住
+apply_temp_boost() {
+    echo -ne "  ${WHITE}预热:${NC}  ${DIM}临时拉满内核参数...${NC}"
+    modprobe tcp_bbr 2>/dev/null
+    # 保存原始值用于回滚
+    ORIG_SYSCTL=$(sysctl -n \
+        net.core.default_qdisc \
+        net.ipv4.tcp_congestion_control \
+        net.core.rmem_max \
+        net.core.wmem_max \
+        net.core.rmem_default \
+        net.core.wmem_default \
+        net.ipv4.tcp_rmem \
+        net.ipv4.tcp_wmem \
+        net.ipv4.tcp_window_scaling \
+        net.ipv4.tcp_slow_start_after_idle \
+        net.ipv4.tcp_no_metrics_save 2>/dev/null)
+    # 临时写入极限值(sysctl -w 仅运行时，重启即失效)
+    sysctl -w \
+        net.core.default_qdisc=fq \
+        net.ipv4.tcp_congestion_control=bbr \
+        net.core.rmem_max=268435456 \
+        net.core.wmem_max=268435456 \
+        net.core.rmem_default=4194304 \
+        net.core.wmem_default=4194304 \
+        "net.ipv4.tcp_rmem=4096 4194304 268435456" \
+        "net.ipv4.tcp_wmem=4096 4194304 268435456" \
+        net.ipv4.tcp_window_scaling=1 \
+        net.ipv4.tcp_slow_start_after_idle=0 \
+        net.ipv4.tcp_no_metrics_save=1 \
+        >/dev/null 2>&1
+    # 临时initcwnd
+    local iface=$(detect_interface)
+    if [ -n "$iface" ]; then
+        local gw=$(ip route show default dev "$iface" 2>/dev/null | awk '/default/{print $3;exit}')
+        [ -n "$gw" ] && ip route change default via "$gw" dev "$iface" initcwnd 128 initrwnd 128 2>/dev/null
+    fi
+    echo -e "\r  ${WHITE}预热:${NC}  ${GREEN}✓${NC} BBR+256MB缓冲+initcwnd128        "
+}
+
+# 回滚临时参数
+rollback_temp_boost() {
+    [ -z "$ORIG_SYSCTL" ] && return
+    local vals; IFS=$'\n' read -rd '' -a vals <<< "$ORIG_SYSCTL"
+    sysctl -w \
+        net.core.default_qdisc="${vals[0]}" \
+        net.ipv4.tcp_congestion_control="${vals[1]}" \
+        net.core.rmem_max="${vals[2]}" \
+        net.core.wmem_max="${vals[3]}" \
+        net.core.rmem_default="${vals[4]}" \
+        net.core.wmem_default="${vals[5]}" \
+        "net.ipv4.tcp_rmem=${vals[6]}" \
+        "net.ipv4.tcp_wmem=${vals[7]}" \
+        net.ipv4.tcp_window_scaling="${vals[8]}" \
+        net.ipv4.tcp_slow_start_after_idle="${vals[9]}" \
+        net.ipv4.tcp_no_metrics_save="${vals[10]}" \
+        >/dev/null 2>&1
+    echo -e "  ${DIM}已回滚临时参数${NC}"
+}
+
+# 自适应测速: 100MB×1 + 10MB×1 + 自适应追加(高带宽用大文件)
 speedtest_probe() {
-    # 固定3轮测速: 100MB×1 + 10MB×2, 取最大值
-    local max_mbps=0 round=0
+    local max_mbps=0 round=0 total=3
 
     _test_url() {
         local url="$1" label="$2" timeout="$3"
         round=$(( round + 1 ))
-        echo -ne "\r  ${WHITE}带宽:${NC}  ${DIM}[${round}/3] ${label}...${NC}                              " >&2
+        echo -ne "\r  ${WHITE}带宽:${NC}  ${DIM}[${round}/${total}] ${label}...${NC}                                    " >&2
         local speed=$(curl -so /dev/null -w '%{speed_download}' --connect-timeout 5 --max-time "$timeout" "$url" 2>/dev/null)
         [ -z "$speed" ] && return
         local mbps=$(awk "BEGIN{v=$speed*8/1000000; printf \"%.0f\",v}" 2>/dev/null)
         [ -n "$mbps" ] && [ "$mbps" -gt "$max_mbps" ] 2>/dev/null && max_mbps=$mbps
     }
 
-    # 第1轮: Cloudflare 100MB (大文件测峰值)
+    # 第1轮: Cloudflare 100MB
     _test_url "https://speed.cloudflare.com/__down?bytes=100000000" "Cloudflare 100MB" 30
-    # 第2轮: Google CDN 10MB
-    _test_url "http://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" "Google CDN 10MB" 10
-    # 第3轮: Cloudflare 10MB (补测取稳定值)
-    _test_url "https://speed.cloudflare.com/__down?bytes=10000000" "Cloudflare 10MB" 15
+    # 第2轮: Google CDN
+    _test_url "http://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" "Google CDN" 10
+    # 第3轮: 自适应追加
+    if [ "$max_mbps" -gt 2000 ] 2>/dev/null; then
+        # >2Gbps: 10GB限时12秒，测持续吞吐
+        _test_url "https://speed.cloudflare.com/__down?bytes=10000000000" "Cloudflare 10GB峰值" 12
+    elif [ "$max_mbps" -gt 500 ] 2>/dev/null; then
+        # >500Mbps: 1GB精确测
+        _test_url "https://speed.cloudflare.com/__down?bytes=1000000000" "Cloudflare 1GB" 15
+    else
+        # <=500Mbps: 10MB补测
+        _test_url "https://speed.cloudflare.com/__down?bytes=10000000" "Cloudflare 10MB" 15
+    fi
 
     echo "$max_mbps"
 }
 
 auto_max_performance() {
-    echo ""; echo -e "  ${BOLD}${CYAN}━━━ 一键最大性能 ━━━${NC}"; echo ""
-    echo -e "  ${DIM}自动检测: 带宽测速 + 延迟探测 + 内存评估${NC}"; echo ""
+    echo ""; echo -e "  ${BOLD}${CYAN}━━━ 一键自动配置 ━━━${NC}"; echo ""
+    echo -e "  ${DIM}流程: 预热内核 → 带宽测速 → 延迟探测 → 选择角色 → 生成配置${NC}"; echo ""
 
     local iface=$(detect_interface)
     echo -e "  ${WHITE}网卡:${NC}  ${BOLD}${iface:-unknown}${NC}"
 
-    # 检测内存
     get_meminfo
     echo -e "  ${WHITE}内存:${NC}  ${BOLD}$(( MEM_TOTAL_KB / 1024 ))MB${NC} + Swap ${BOLD}$(( SWAP_TOTAL_KB / 1024 ))MB${NC}"
 
-    # 探测延迟
+    # ① 临时拉满内核参数
+    apply_temp_boost
+
+    # ② 探测延迟
     local best_rtt=200
     echo -ne "  ${WHITE}延迟:${NC}  探测中..."
     for target in 8.8.8.8 1.1.1.1 142.250.80.46; do
@@ -364,13 +436,12 @@ auto_max_performance() {
     [ $best_rtt -lt 20 ] && best_rtt=20
     echo -e "\r  ${WHITE}延迟:${NC}  ${BOLD}RTT ${best_rtt}ms${NC}                    "
 
-    # 真实带宽测速 (Cloudflare + Google CDN)
+    # ③ 真实带宽测速
     echo -ne "  ${WHITE}带宽:${NC}  测速中..."
     local bw=$(speedtest_probe)
     if [ "$bw" -gt 0 ] 2>/dev/null; then
-        echo -e "\r  ${WHITE}带宽:${NC}  ${BOLD}${bw}Mbps${NC} (Cloudflare/Google实测)         "
+        echo -e "\r  ${WHITE}带宽:${NC}  ${BOLD}${bw}Mbps${NC} (Cloudflare/Google实测)                  "
     else
-        # 测速失败回退: 读网卡速率再打折
         local link_speed=100
         if [ -n "$iface" ]; then
             if command -v ethtool >/dev/null 2>&1; then
@@ -382,7 +453,6 @@ auto_max_performance() {
                 [ -r "$sf" ] && { local sv=$(cat "$sf" 2>/dev/null); [ -n "$sv" ] && [ "$sv" -gt 0 ] 2>/dev/null && link_speed=$sv; }
             fi
         fi
-        # 网卡速率不等于实际带宽，保守取1/10
         bw=$(( link_speed / 10 ))
         [ $bw -lt 10 ] && bw=10
         echo -e "\r  ${WHITE}带宽:${NC}  ${BOLD}${bw}Mbps${NC} ${YELLOW}(测速失败,估算值)${NC}          "
@@ -393,13 +463,14 @@ auto_max_performance() {
     echo -e "  ${WHITE}BDP:${NC}   ${BOLD}$(( bdp / 1024 ))KB${NC} (${bw}Mbps × ${best_rtt}ms)"
     echo ""
 
-    # 确认测速结果
+    # ④ 确认测速结果
     if ! confirm_action "使用此结果生成配置?"; then
         echo -e "  ${DIM}已取消${NC}"
+        rollback_temp_boost
         return
     fi
 
-    # 选择服务器角色
+    # ⑤ 选择服务器角色
     echo ""
     echo -e "  ${DIM}用户 → ①前置 → ②IX → ③转发 → ④落地 → 目标${NC}"; echo ""
     select_menu "本机角色" "① 前置服务器 (用户直连入口)" "② IX专线服务器 (上下游中转)" "③ 转发/线路服务器 (国际线路)" "④ 落地服务器 (出口访问目标)" "⑤ 通用 (不区分角色)"
@@ -418,6 +489,7 @@ auto_max_performance() {
 # 内存: $(( MEM_TOTAL_KB / 1024 ))MB + Swap $(( SWAP_TOTAL_KB / 1024 ))MB
 # RTT: ${best_rtt}ms (探测) | BDP: $(( bdp / 1024 ))KB"
 
+    # ⑥ 生成并应用最终配置(替换临时参数)
     apply_sysctl_config "${role_name} (${bw}Mbps×${best_rtt}ms)" \
         "$(calculate_and_generate "${role_name} (${bw}Mbps×${best_rtt}ms)" "$bw" "$best_rtt" "$bw" "$best_rtt" "$h")"
 }
