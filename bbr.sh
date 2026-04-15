@@ -1,11 +1,12 @@
 #!/bin/bash
 # ============================================================
-# 专线网络优化工具 v3.0
-# 功能: BBR/sysctl优化 + 链路向导 + 国家白名单 + 端口监控
+# 专线网络优化工具 v3.1
+# 功能: BBR/sysctl优化 + initcwnd秒开 + 链路向导 + 国家白名单 + 端口监控
+# 优化: 大缓冲/强突发/低延迟/高兼容
 # 用法: sudo bash network-optimizer.sh [命令]
 # ============================================================
 
-VERSION="v3.0"
+VERSION="v3.1-yt"
 CONFIG_DIR="/etc/network-optimizer"
 SYSCTL_CONF="$CONFIG_DIR/sysctl-optimize.conf"
 PROFILE_CONF="$CONFIG_DIR/profile.conf"
@@ -143,38 +144,39 @@ calculate_and_generate() {
     local bdp=$bdp_up; [ $bdp_dn -gt $bdp ] && bdp=$bdp_dn
     local mbw=$up_bw; [ $down_bw -gt $mbw ] && mbw=$down_bw
 
-    # 缓冲区
+    # 缓冲区 (YouTube流媒体优化: 4倍BDP, 更高下限)
     local def=$(( (bdp / 65536 + 1) * 65536 ))
-    [ $def -lt 131072 ] && def=131072; [ $def -gt 2097152 ] && def=2097152
-    local max=$(( (bdp * 2 + 1048575) / 1048576 * 1048576 ))
-    [ $max -lt 1048576 ] && max=1048576; [ $max -gt 134217728 ] && max=134217728
+    [ $def -lt 262144 ] && def=262144; [ $def -gt 4194304 ] && def=4194304
+    local max=$(( (bdp * 4 + 1048575) / 1048576 * 1048576 ))
+    [ $max -lt 2097152 ] && max=2097152; [ $max -gt 268435456 ] && max=268435456
     [ $def -gt $(( max / 2 )) ] && def=$(( max / 2 ))
 
-    # tcp_mem
+    # tcp_mem (宽裕模式: 提高阈值避免内存压力丢包)
     get_meminfo
     local pg=$(( MEM_AVAIL_KB / 4 ))
-    local ml=$(( pg * 3 / 100 )) mp=$(( pg * 6 / 100 )) mh=$(( pg * 10 / 100 ))
+    local ml=$(( pg * 5 / 100 )) mp=$(( pg * 10 / 100 )) mh=$(( pg * 15 / 100 ))
     local mnh=$(( max * 2 / 1024 * 50 / 4 ))
     [ $mh -lt $mnh ] && mh=$mnh
     [ $mp -lt $(( mh * 6 / 10 )) ] && mp=$(( mh * 6 / 10 ))
     [ $ml -lt $(( mh * 3 / 10 )) ] && ml=$(( mh * 3 / 10 ))
-    [ $ml -lt 65536 ] && ml=65536; [ $mp -lt 98304 ] && mp=98304; [ $mh -lt 131072 ] && mh=131072
+    [ $ml -lt 65536 ] && ml=65536; [ $mp -lt 131072 ] && mp=131072; [ $mh -lt 262144 ] && mh=262144
 
-    # 动态参数
-    local lowat=$(clamp $(( mbw * 128 )) 16384 524288)
-    local smc=$(clamp $(( mbw * 66 )) 1024 65535)
-    local synbl=$(clamp $(( mbw * 32 )) 512 262144)
-    local ndbl=$(clamp $(( mbw * 64 )) 1000 524288)
-    local tw=$(clamp $(( mbw * 4000 )) 65536 16000000)
-    local orph=$(clamp $(( mbw * 128 )) 2048 524288)
-    local fmax=$(clamp $(( mbw * 2048 )) 65536 10485760)
-    local udpr=$(clamp $(( bdp / 8 )) 16384 524288)
-    local udpml=$(( udpr * 2 / 4096 )); [ $udpml -lt 4096 ] && udpml=4096
-    local fin=$(clamp $(( 30 - mbw / 200 )) 5 30)
-    local omem=$(clamp $(( mbw * 105 )) 65536 1048576)
-    local ndb=$(clamp $(( mbw + 300 )) 300 2000)
-    local dw=$(clamp $(( mbw / 16 + 32 )) 32 128)
-    local bp=0 br=0; [ $mbw -ge 50 ] && { bp=$(clamp $(( mbw / 20 )) 50 100); br=$bp; }
+    # 动态参数 (YouTube优化: 秒开+大突发+稳定)
+    local lowat=$(clamp $(( mbw * 64 )) 8192 262144)
+    local smc=$(clamp $(( mbw * 80 )) 2048 65535)
+    local synbl=$(clamp $(( mbw * 48 )) 1024 262144)
+    local ndbl=$(clamp $(( mbw * 96 )) 2000 1048576)
+    local tw=$(clamp $(( mbw * 5000 )) 131072 16000000)
+    local orph=$(clamp $(( mbw * 160 )) 4096 524288)
+    local fmax=$(clamp $(( mbw * 2048 )) 131072 10485760)
+    local udpr=$(clamp $(( bdp / 4 )) 32768 1048576)
+    local udpml=$(( udpr * 2 / 4096 )); [ $udpml -lt 8192 ] && udpml=8192
+    local fin=$(clamp $(( 30 - mbw / 200 )) 10 30)
+    local omem=$(clamp $(( mbw * 128 )) 131072 2097152)
+    local ndb=$(clamp $(( mbw * 2 + 600 )) 600 4000)
+    local dw=$(clamp $(( mbw / 8 + 64 )) 64 256)
+    local bp=0 br=0; [ $mbw -ge 20 ] && { bp=$(clamp $(( mbw / 10 )) 50 200); br=$bp; }
+    local initcwnd=$(clamp $(( mbw / 10 + 30 )) 30 128)
 
     cat << EOF
 # ============================================================
@@ -199,37 +201,38 @@ net.ipv4.tcp_wmem = 4096 $def $max
 net.core.optmem_max = $omem
 net.ipv4.tcp_mem = $ml $mp $mh
 
-# --- 低延迟 ---
+# --- 低延迟 (秒开核心) ---
 net.ipv4.tcp_notsent_lowat = $lowat
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_autocorking = 0
 
-# --- 重传 ---
+# --- 重传 (跨国链路优化) ---
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
-net.ipv4.tcp_frto = 0
+net.ipv4.tcp_frto = 2
 net.ipv4.tcp_early_retrans = 3
-net.ipv4.tcp_retries2 = 15
-net.ipv4.tcp_orphan_retries = 3
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_orphan_retries = 2
 
-# --- ECN ---
-net.ipv4.tcp_ecn = 2
+# --- ECN (关闭避免兼容性问题) ---
+net.ipv4.tcp_ecn = 0
 net.ipv4.tcp_ecn_fallback = 1
 
 # --- MTU ---
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_base_mss = 1460
 
-# --- TCP行为 ---
+# --- TCP行为 (稳定优先) ---
 net.ipv4.tcp_rfc1337 = 1
-net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_fastopen = 1
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = $fin
-net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_time = 30
 net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_probes = 3
 
 # --- 连接队列 ---
 net.core.somaxconn = $smc
@@ -268,10 +271,24 @@ net.ipv4.conf.default.rp_filter = 2
 vm.swappiness = 1
 vm.vfs_cache_pressure = 50
 fs.file-max = $fmax
+
+# --- initcwnd (秒开核心, 通过ip route设置) ---
+# initcwnd=$initcwnd initrwnd=$initcwnd
 EOF
 }
 
 # ==================== 应用配置 ====================
+apply_initcwnd() {
+    local icwnd=$(grep -oP 'initcwnd=\K[0-9]+' "$SYSCTL_CONF" 2>/dev/null || echo 30)
+    local iface=$(detect_interface)
+    [ -z "$iface" ] && return
+    local gw=$(ip route show default dev "$iface" 2>/dev/null | awk '/default/{print $3;exit}')
+    [ -z "$gw" ] && return
+    ip route change default via "$gw" dev "$iface" initcwnd "$icwnd" initrwnd "$icwnd" 2>/dev/null && \
+        echo -e "  ${GREEN}✓${NC} initcwnd=${icwnd} initrwnd=${icwnd} (秒开加速)" || \
+        echo -e "  ${YELLOW}⚠${NC} initcwnd设置失败(不影响使用)"
+}
+
 apply_sysctl_config() {
     local role_name="$1" config="$2"
     echo ""; echo -e "  ${BOLD}${CYAN}生成配置: $role_name${NC}"
@@ -290,6 +307,7 @@ apply_sysctl_config() {
     if confirm_action "立即应用?"; then
         local err=$(sysctl --system 2>&1 | grep -i "error\|cannot\|invalid" || true)
         [ -n "$err" ] && echo "$err" | head -3 | sed 's/^/    /'
+        apply_initcwnd
         echo -e "  ${GREEN}✓${NC} 已生效 | $(sysctl -n net.ipv4.tcp_congestion_control) + $(sysctl -n net.core.default_qdisc)"
     else echo -e "  ${DIM}已保存，sysctl --system 生效${NC}"; fi
     echo ""
@@ -373,6 +391,8 @@ show_status() {
     [ -f "$PROFILE_CONF" ] && { source "$PROFILE_CONF"; echo -e "  ${GREEN}●${NC} BBR: ${WHITE}$SYSCTL_PROFILE_NAME${NC}"; } || echo -e "  ${DIM}○ BBR: 未配置${NC}"
     echo -e "  拥塞: ${BOLD}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${NC} | 队列: ${BOLD}$(sysctl -n net.core.default_qdisc 2>/dev/null)${NC}"
     echo -e "  rmem_max: ${BOLD}$(( $(sysctl -n net.core.rmem_max 2>/dev/null) / 1048576 ))MB${NC} | lowat: ${BOLD}$(( $(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null) / 1024 ))KB${NC}"
+    local icwnd=$(ip route show default 2>/dev/null | grep -oP 'initcwnd \K[0-9]+' || echo "-")
+    echo -e "  initcwnd: ${BOLD}${icwnd}${NC} | ECN: ${BOLD}$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null)${NC} | TFO: ${BOLD}$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)${NC}"
     get_meminfo; echo -e "  内存: ${BOLD}$(( MEM_TOTAL_KB / 1024 ))MB${NC} | Swap: ${BOLD}$(( SWAP_TOTAL_KB / 1024 ))MB${NC}"
     echo ""
     if nft list table inet geo_filter >/dev/null 2>&1; then
@@ -411,6 +431,7 @@ toggle_service() {
 
 service_start() {
     [ -f "$SYSCTL_CONF" ] && sysctl --system >/dev/null 2>&1
+    [ -f "$SYSCTL_CONF" ] && apply_initcwnd >/dev/null 2>&1
     [ -f "$GEO_NFT" ] && nft -f "$GEO_NFT" 2>/dev/null
 }
 service_stop() { :; }
@@ -429,6 +450,7 @@ reload_network() {
     fi
     echo ""
     [ -f "$SYSCTL_CONF" ] && run_cmd "sysctl重载" sysctl --system || echo -e "  ${DIM}无配置${NC}"
+    [ -f "$SYSCTL_CONF" ] && apply_initcwnd
     [ -f "$GEO_NFT" ] && run_cmd "白名单重载" nft -f "$GEO_NFT"
     echo -e "  ${GREEN}${BOLD}完成${NC} | $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) rmem$(( $(sysctl -n net.core.rmem_max 2>/dev/null) / 1048576 ))MB"; echo ""
 }
