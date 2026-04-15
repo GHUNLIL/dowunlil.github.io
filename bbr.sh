@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# 专线网络优化工具 v3.1
+# 专线网络优化工具 v3.1-yt (YouTube秒开优化版)
 # 功能: BBR/sysctl优化 + initcwnd秒开 + 链路向导 + 国家白名单 + 端口监控
 # 优化: 大缓冲/强突发/低延迟/高兼容
 # 用法: sudo bash network-optimizer.sh [命令]
@@ -313,6 +313,63 @@ apply_sysctl_config() {
     echo ""
 }
 
+# ==================== 一键最大性能 ====================
+auto_max_performance() {
+    echo ""; echo -e "  ${BOLD}${CYAN}━━━ 一键最大性能 ━━━${NC}"; echo ""
+    echo -e "  ${DIM}自动检测硬件，跳过向导直接拉满${NC}"; echo ""
+
+    # 检测网卡速率
+    local iface=$(detect_interface)
+    local link_speed=1000
+    if [ -n "$iface" ]; then
+        # 优先 ethtool
+        if command -v ethtool >/dev/null 2>&1; then
+            local es=$(ethtool "$iface" 2>/dev/null | awk '/Speed:/{gsub(/[^0-9]/,"",$2);print $2}')
+            [ -n "$es" ] && [ "$es" -gt 0 ] 2>/dev/null && link_speed=$es
+        fi
+        # 回退 /sys
+        if [ "$link_speed" -le 0 ] 2>/dev/null || [ "$link_speed" = "1000" ]; then
+            local sf="/sys/class/net/${iface}/speed"
+            [ -r "$sf" ] && { local sv=$(cat "$sf" 2>/dev/null); [ -n "$sv" ] && [ "$sv" -gt 0 ] 2>/dev/null && link_speed=$sv; }
+        fi
+    fi
+    echo -e "  ${WHITE}网卡:${NC}  ${BOLD}${iface:-unknown}${NC} @ ${BOLD}${link_speed}Mbps${NC}"
+
+    # 检测内存
+    get_meminfo
+    echo -e "  ${WHITE}内存:${NC}  ${BOLD}$(( MEM_TOTAL_KB / 1024 ))MB${NC} + Swap ${BOLD}$(( SWAP_TOTAL_KB / 1024 ))MB${NC}"
+
+    # 探测延迟 (ping Google/Cloudflare/YouTube 取最小值作为基准)
+    local best_rtt=200
+    echo -ne "  ${WHITE}延迟:${NC}  探测中..."
+    for target in 8.8.8.8 1.1.1.1 142.250.80.46; do
+        local ms=$(ping -c 2 -W 3 -q "$target" 2>/dev/null | awk -F'/' '/rtt/{printf "%.0f",$5}')
+        if [ -n "$ms" ] && [ "$ms" -gt 0 ] 2>/dev/null; then
+            local rtt_val=$(( ms * 2 ))
+            [ $rtt_val -lt $best_rtt ] && best_rtt=$rtt_val
+        fi
+    done
+    # 最低RTT保底20ms
+    [ $best_rtt -lt 20 ] && best_rtt=20
+    echo -e "\r  ${WHITE}延迟:${NC}  ${BOLD}RTT ${best_rtt}ms${NC} (自动探测)        "
+
+    # 带宽取网卡速率 (VPS一般端口速率=实际可用)
+    local bw=$link_speed
+
+    # 显示计算结果
+    local bdp=$(( bw * best_rtt * 125 ))
+    echo -e "  ${WHITE}BDP:${NC}   ${BOLD}$(( bdp / 1024 ))KB${NC} (${bw}Mbps × ${best_rtt}ms)"
+    echo ""
+
+    local h="# 角色: 一键最大性能 (自动检测)
+# 网卡: ${iface:-unknown} @ ${link_speed}Mbps
+# 内存: $(( MEM_TOTAL_KB / 1024 ))MB + Swap $(( SWAP_TOTAL_KB / 1024 ))MB
+# RTT: ${best_rtt}ms (自动探测) | BDP: $(( bdp / 1024 ))KB"
+
+    apply_sysctl_config "极速 (${bw}Mbps×${best_rtt}ms)" \
+        "$(calculate_and_generate "极速 (${bw}Mbps×${best_rtt}ms)" "$bw" "$best_rtt" "$bw" "$best_rtt" "$h")"
+}
+
 # ==================== 链路向导 ====================
 wizard_main() {
     echo ""; echo -e "  ${BOLD}${CYAN}━━━ BBR优化 - 链路向导 ━━━${NC}"
@@ -607,8 +664,8 @@ interactive_main() {
         nft list table inet geo_filter >/dev/null 2>&1 && { [ -f "$GEO_CONF" ] && source "$GEO_CONF"; echo -e "  ${GREEN}●${NC} 白名单: ${WHITE}${GEO_COUNTRIES:-启用}${NC}"; } || echo -e "  ${DIM}○ 白名单: 未启用${NC}"
         local al="安装自启"; systemctl is-enabled network-optimizer.service >/dev/null 2>&1 && { echo -e "  ${GREEN}●${NC} 自启: 启用"; al="关闭自启"; } || echo -e "  ${DIM}○ 自启: 未启用${NC}"
         get_meminfo; echo -e "  ${DIM}内存$(( MEM_TOTAL_KB/1024 ))M Swap$(( SWAP_TOTAL_KB/1024 ))M${NC}"; echo ""
-        select_menu "操作" "BBR优化" "白名单" "状态" "端口监控" "刷新配置" "$al" "恢复默认" "退出"
-        case $? in 0) wizard_main;; 1) geo_main;continue;; 2) show_status;; 3) port_monitor;continue;; 4) reload_network;; 5) toggle_service;; 6) restore_defaults;; 7) rst;exit 0;; esac
+        select_menu "操作" "⚡ 一键最大性能" "BBR链路向导" "白名单" "状态" "端口监控" "刷新配置" "$al" "恢复默认" "退出"
+        case $? in 0) auto_max_performance;; 1) wizard_main;; 2) geo_main;continue;; 3) show_status;; 4) port_monitor;continue;; 5) reload_network;; 6) toggle_service;; 7) restore_defaults;; 8) rst;exit 0;; esac
         echo -ne "  ${DIM}回车返回...${NC}"; read -r
     done
 }
@@ -616,8 +673,9 @@ interactive_main() {
 # ==================== 入口 ====================
 case "${1}" in
     start|service-start) service_start;; stop|service-stop) service_stop;; status) show_status;;
+    auto) auto_max_performance;;
     install) install_service;; restore) restore_defaults;; wizard) wizard_main;;
     geo-update) geo_update;; geo-remove) geo_remove;; geo-status) geo_status;;
     ports) port_all;; ports-rank) port_rank;; "") interactive_main;;
-    *) echo "$VERSION | $0 [wizard|status|ports|install|restore|geo-update|geo-remove]"; exit 1;;
+    *) echo "$VERSION | $0 [auto|wizard|status|ports|install|restore|geo-update|geo-remove]"; exit 1;;
 esac
