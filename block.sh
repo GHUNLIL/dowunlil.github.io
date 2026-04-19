@@ -51,85 +51,64 @@ cat_name() {
 }
 
 cat_domains() {
+    # 尽量使用 geosite: 标签(Xray 从 geosite.dat 里加载),社区维护,无需手动更新。
+    # 对 geosite 没收录的类别,用 domain: 硬编码补充。
+    # 所有 geosite 名称均已按 v2fly/domain-list-community 实测校对过。
     case "$1" in
         speedtest) printf '%s\n' \
-            domain:speedtest.net domain:fast.com domain:librespeed.org \
-            domain:ookla.com domain:speedof.me domain:nperf.com domain:testmy.net \
-            domain:dslreports.com domain:speedcheck.org domain:speedtest.cn \
-            domain:meter.net domain:bandwidthplace.com domain:speedsmart.net \
-            domain:speed.cloudflare.com domain:speed.miwifi.com domain:measurementlab.net
+            geosite:category-speedtest \
+            domain:speed.cloudflare.com domain:speed.miwifi.com \
+            domain:bandwidthplace.com domain:speedsmart.net domain:nperf.com \
+            domain:measurementlab.net domain:librespeed.org
             ;;
         ipcheck) printf '%s\n' \
-            domain:ping0.cc domain:ipinfo.io domain:ipapi.co domain:ip-api.com \
-            domain:ipquality.com domain:ipqualityscore.com domain:scamalytics.com \
-            domain:spur.us domain:iplocation.net domain:iplocation.com domain:whoer.net \
-            domain:ipleak.net domain:browserleaks.com domain:abuseipdb.com \
-            domain:maxmind.com domain:db-ip.com domain:ipregistry.co domain:ipdata.co \
-            domain:ip2location.com domain:ipgeolocation.io domain:iplark.com \
-            domain:ip138.com domain:ip.sb domain:ip.cn domain:myip.com domain:myip.ms \
-            domain:whatismyipaddress.com domain:whatismyip.com domain:check-host.net \
-            domain:ipx.ac domain:showmyip.com domain:ip-score.com domain:ip-checker.info \
-            domain:ip-tracker.org domain:ip-adress.com domain:2ip.ru domain:whoer.com \
-            domain:ipfighter.com domain:getipintel.net domain:criminalip.io \
-            domain:fraudguard.io domain:proxycheck.io domain:ipverse.net \
-            domain:bgp.he.net domain:bgp.tools domain:bgpview.io
+            domain:ping0.cc domain:ip.sb domain:ip.cn domain:iplark.com \
+            domain:ipinfo.io domain:ipapi.co domain:ip-api.com \
+            domain:scamalytics.com domain:ipqualityscore.com domain:spur.us \
+            domain:ipquality.com domain:criminalip.io domain:fraudguard.io \
+            domain:proxycheck.io domain:getipintel.net domain:ipfighter.com \
+            domain:abuseipdb.com domain:ipleak.net domain:browserleaks.com \
+            domain:whoer.net domain:whoer.com domain:2ip.ru \
+            domain:check-host.net domain:ipx.ac domain:showmyip.com \
+            domain:bgp.he.net domain:bgp.tools domain:bgpview.io domain:ipverse.net \
+            domain:whatismyipaddress.com domain:myip.com domain:myip.ms \
+            domain:iplocation.net domain:ipgeolocation.io domain:ip2location.com \
+            domain:maxmind.com domain:db-ip.com
             ;;
         ads) printf '%s\n' \
-            domain:doubleclick.net domain:googleadservices.com domain:googlesyndication.com \
-            domain:google-analytics.com domain:googletagmanager.com domain:googletagservices.com \
-            domain:amazon-adsystem.com domain:adnxs.com domain:scorecardresearch.com \
-            domain:quantserve.com domain:outbrain.com domain:taboola.com domain:criteo.com \
-            domain:adsafeprotected.com domain:moatads.com domain:adform.net domain:pubmatic.com \
-            domain:rubiconproject.com domain:openx.net domain:casalemedia.com domain:advertising.com \
-            domain:adsrvr.org domain:mgid.com domain:popads.net domain:propellerads.com \
-            domain:revcontent.com domain:smartadserver.com domain:media.net
+            geosite:category-ads-all
             ;;
         adult) printf '%s\n' \
-            domain:pornhub.com domain:xvideos.com domain:xnxx.com domain:xhamster.com \
-            domain:redtube.com domain:youporn.com domain:tnaflix.com domain:spankbang.com \
-            domain:chaturbate.com domain:livejasmin.com domain:stripchat.com domain:bongacams.com \
-            domain:onlyfans.com domain:myfreecams.com domain:brazzers.com domain:realitykings.com
+            geosite:category-porn
             ;;
         social) printf '%s\n' \
-            domain:facebook.com domain:fbcdn.net domain:messenger.com domain:instagram.com \
-            domain:cdninstagram.com domain:twitter.com domain:x.com domain:twimg.com \
-            domain:snapchat.com domain:reddit.com domain:redd.it domain:pinterest.com \
-            domain:pinimg.com domain:linkedin.com domain:tumblr.com domain:threads.net \
-            domain:bsky.app
+            geosite:facebook geosite:twitter geosite:instagram \
+            geosite:reddit geosite:linkedin geosite:pinterest \
+            geosite:snap geosite:tumblr
             ;;
         tiktok) printf '%s\n' \
-            domain:tiktok.com domain:tiktokcdn.com domain:tiktokcdn-us.com \
-            domain:tiktokcdn-eu.com domain:tiktokv.com domain:tiktokv.us \
-            domain:musical.ly domain:bytedance.com domain:bytedance.net \
-            domain:byteoversea.com domain:bytecdn.cn domain:ibytedtos.com \
-            domain:ipstatp.com domain:tiktokusercontent.com domain:tiktokglobalshop.com \
-            domain:tiktokshop.com domain:capcut.com domain:lemon8-app.com
+            geosite:tiktok geosite:bytedance
             ;;
         streaming) printf '%s\n' \
-            domain:netflix.com domain:nflxvideo.net domain:nflximg.net domain:disneyplus.com \
-            domain:hulu.com domain:hbo.com domain:hbomax.com domain:max.com domain:youtube.com \
-            domain:googlevideo.com domain:ytimg.com domain:twitch.tv domain:ttvnw.net \
-            domain:spotify.com domain:scdn.co domain:primevideo.com domain:paramountplus.com \
-            domain:peacocktv.com domain:iqiyi.com domain:youku.com domain:bilibili.com
+            geosite:netflix geosite:youtube geosite:disney \
+            geosite:hbo geosite:hulu geosite:spotify \
+            geosite:twitch geosite:primevideo \
+            geosite:bilibili geosite:iqiyi geosite:youku
             ;;
         ai) printf '%s\n' \
-            domain:openai.com domain:chatgpt.com domain:oaistatic.com domain:oaiusercontent.com \
-            domain:anthropic.com domain:claude.ai domain:gemini.google.com domain:bard.google.com \
-            domain:copilot.microsoft.com domain:perplexity.ai domain:character.ai \
-            domain:midjourney.com domain:stability.ai domain:huggingface.co domain:poe.com \
-            domain:mistral.ai
+            geosite:openai geosite:anthropic geosite:google-gemini \
+            geosite:perplexity geosite:category-ai-chat-!cn \
+            domain:copilot.microsoft.com domain:copilot.cloud.microsoft
             ;;
         gambling) printf '%s\n' \
-            domain:bet365.com domain:pokerstars.com domain:888casino.com domain:williamhill.com \
-            domain:paddypower.com domain:ladbrokes.com domain:bwin.com domain:betfair.com \
-            domain:unibet.com domain:betway.com domain:draftkings.com domain:fanduel.com \
-            domain:sbobet.com
+            domain:bet365.com domain:pokerstars.com domain:888casino.com \
+            domain:williamhill.com domain:paddypower.com domain:ladbrokes.com \
+            domain:bwin.com domain:betfair.com domain:unibet.com domain:betway.com \
+            domain:draftkings.com domain:fanduel.com domain:sbobet.com \
+            domain:stake.com domain:rollbit.com domain:bc.game
             ;;
         crypto) printf '%s\n' \
-            domain:binance.com domain:coinbase.com domain:kraken.com domain:bitfinex.com \
-            domain:okx.com domain:bybit.com domain:kucoin.com domain:gate.io domain:huobi.com \
-            domain:bitstamp.net domain:crypto.com domain:blockchain.com domain:mexc.com \
-            domain:bitget.com
+            geosite:category-cryptocurrency
             ;;
     esac
 }
