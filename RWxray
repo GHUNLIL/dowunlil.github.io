@@ -1,0 +1,307 @@
+{
+  "log": {
+    "dnsLog": false,
+    "loglevel": "warning"
+  },
+  "dns": {
+    "tag": "dns-in",
+    "servers": [
+      "1.1.1.1",
+      "1.0.0.1"
+    ],
+    "disableCache": false,
+    "queryStrategy": "UseIP"
+  },
+  "inbounds": [
+    {
+      "tag": "Shadowsocks",
+      "port": 设置端口,
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "chacha20-ietf-poly1305",
+        "clients": [],
+        "network": "tcp,udp"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      }
+    },
+    {
+      "tag": "Shadowsocks-名字不能重复协议可以",
+      "port": 设置端口,
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "chacha20-ietf-poly1305",
+        "clients": [],
+        "network": "tcp,udp"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      }
+    },
+    {
+      "tag": "SHADOWSOCKS可以多个",
+      "port": 设置端口,
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "2022-blake3-aes-256-gcm",
+        "clients": [],
+        "network": "tcp,udp",
+        "password": "密码可以找AI问生成"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      }
+    },
+    {
+      "tag": "MIXED",
+      "port": 设置端口,
+      "listen": "0.0.0.0",
+      "protocol": "mixed",
+      "settings": {
+        "udp": true,
+        "auth": "password",
+        "accounts": [
+          {
+            "pass": "sk5的用户名",
+            "user": "sk5的密码"
+          }
+        ]
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      }
+    },
+    {
+      "tag": "VLESS_REALITY",
+      "port": 设置端口,
+      "listen": "0.0.0.0",
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "www.microsoft.com:443",
+          "show": false,
+          "xver": 0,
+          "shortIds": [
+            "问AI"
+          ],
+          "privateKey": "S问AI",
+          "serverNames": [
+            "www.microsoft.com"
+          ]
+        }
+      }
+    },
+    {
+      "tag": "VLESS-PREMIUM-可以改",
+      "port": 设置端口,
+      "listen": "0.0.0.0",
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "www.microsoft.com:443",
+          "show": false,
+          "xver": 0,
+          "shortIds": [
+            "问AI"
+          ],
+          "privateKey": "问AI",
+          "serverNames": [
+            "www.microsoft.com"
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "DIRECT",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4v6"
+      }
+    },
+    {
+      "tag": "BLOCK",
+      "protocol": "blackhole"
+    },
+    {
+      "tag": "DNS-OUT",
+      "protocol": "dns"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "ruleTag": "DNS 劫持 (防明文泄漏)",
+        "inboundTag": [
+          "dns-in"
+        ],
+        "outboundTag": "DNS-OUT"
+      },
+      {
+        "port": "53",
+        "type": "field",
+        "network": "udp,tcp",
+        "ruleTag": "DNS 53 端口劫持",
+        "outboundTag": "DNS-OUT"
+      },
+      {
+        "type": "field",
+        "ruleTag": "屏蔽 BT/PT 流量 (防滥用导致机器被封)",
+        "protocol": [
+          "bittorrent"
+        ],
+        "outboundTag": "BLOCK"
+      },
+      {
+        "ip": [
+          "geoip:private"
+        ],
+        "type": "field",
+        "ruleTag": "屏蔽私有/保留 IP (防 SSRF 攻击本机内网)",
+        "outboundTag": "BLOCK"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "geosite:category-ads-all"
+        ],
+        "ruleTag": "广告追踪 (改 DIRECT 关闭屏蔽)",
+        "outboundTag": "BLOCK"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "domain:bet365.com",
+          "domain:pokerstars.com",
+          "domain:888casino.com",
+          "domain:williamhill.com",
+          "domain:betway.com",
+          "domain:draftkings.com",
+          "domain:fanduel.com",
+          "domain:sbobet.com",
+          "domain:stake.com",
+          "domain:rollbit.com"
+        ],
+        "ruleTag": "博彩 (改 DIRECT 关闭屏蔽)",
+        "outboundTag": "BLOCK"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "domain:ping0.cc",
+          "domain:ipinfo.io",
+          "domain:scamalytics.com",
+          "domain:spur.us",
+          "domain:ipqualityscore.com",
+          "domain:whoer.net",
+          "domain:ipleak.net",
+          "domain:browserleaks.com",
+          "domain:abuseipdb.com",
+          "domain:criminalip.io",
+          "domain:fraudguard.io",
+          "domain:proxycheck.io",
+          "domain:ip.sb",
+          "domain:ip.cn",
+          "domain:bgp.he.net",
+          "domain:bgp.tools"
+        ],
+        "ruleTag": "IP 纯净度检测站 (改 DIRECT 关闭屏蔽)",
+        "outboundTag": "BLOCK"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "geosite:category-speedtest"
+        ],
+        "ruleTag": "测速网站 (改 BLOCK 屏蔽)",
+        "outboundTag": "BLOCK"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "geosite:category-porn"
+        ],
+        "ruleTag": "成人内容 (改 BLOCK 屏蔽)",
+        "outboundTag": "DIRECT"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "geosite:tiktok",
+          "geosite:bytedance"
+        ],
+        "ruleTag": "TikTok",
+        "outboundTag": "BLOCK"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "geosite:category-ai-chat-!cn"
+        ],
+        "ruleTag": "AI 海外",
+        "outboundTag": "DIRECT"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "geosite:category-cryptocurrency"
+        ],
+        "ruleTag": "加密货币",
+        "outboundTag": "DIRECT"
+      }
+    ],
+    "domainStrategy": "IPIfNonMatch"
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "connIdle": 300,
+        "handshake": 4,
+        "bufferSize": 4,
+        "uplinkOnly": 2,
+        "downlinkOnly": 5
+      }
+    },
+    "system": {
+      "statsInboundUplink": false,
+      "statsOutboundUplink": false,
+      "statsInboundDownlink": false,
+      "statsOutboundDownlink": false
+    }
+  }
+}
