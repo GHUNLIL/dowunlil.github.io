@@ -1,12 +1,14 @@
 #!/bin/bash
 # ============================================================
-# 专线网络优化工具 v3.1-yt (YouTube秒开优化版)
+# 专线网络优化工具 v3.2 (Bug修复版)
 # 功能: BBR/sysctl优化 + initcwnd秒开 + 链路向导 + 国家白名单 + 端口监控
-# 优化: 大缓冲/强突发/低延迟/高兼容
-# 用法: sudo bash network-optimizer.sh [命令]
+# 修复: tcp_mem OOM / def缓冲封顶 / MemAvailable / tcp_fastopen=3
+#       fin_timeout公式 / lowat自适应 / netdev_budget上限 / busy_poll线性
+#       rollback tcp_rmem/wmem格式 / collect_lines冗余行
+# 用法: sudo bash bbr.sh [命令]
 # ============================================================
 
-VERSION="v3.1-yt"
+VERSION="v3.2"
 CONFIG_DIR="/etc/network-optimizer"
 SYSCTL_CONF="$CONFIG_DIR/sysctl-optimize.conf"
 PROFILE_CONF="$CONFIG_DIR/profile.conf"
@@ -52,7 +54,9 @@ get_meminfo() {
     SWAP_TOTAL_KB=$(awk '/SwapTotal/{print $2}' /proc/meminfo 2>/dev/null)
     [ -z "$MEM_TOTAL_KB" ] && MEM_TOTAL_KB=2097152
     [ -z "$SWAP_TOTAL_KB" ] && SWAP_TOTAL_KB=0
-    MEM_AVAIL_KB=$(( MEM_TOTAL_KB + SWAP_TOTAL_KB ))
+    # Fix: 使用 MemAvailable 而非 MemTotal+Swap，避免高估可用内存
+    MEM_AVAIL_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null)
+    [ -z "$MEM_AVAIL_KB" ] && MEM_AVAIL_KB=$(( MEM_TOTAL_KB / 2 ))
 }
 
 # ==================== 交互组件 ====================
@@ -105,7 +109,6 @@ collect_lines() {
         echo -e "  ${DIM}→ ${ln}: ${bw}Mbps × ${rtt}ms = $(( bdp / 1024 ))KB BDP${NC}"
         [ $bdp -gt $CL_MAX_BDP ] && { CL_MAX_BDP=$bdp; CL_MAIN_BW=$bw; CL_MAIN_RTT=$rtt; }
         [ $bw -gt $CL_MAX_BW ] && CL_MAX_BW=$bw
-        [ $CL_COUNT -eq 1 ] && { CL_MAIN_BW=$bw; CL_MAIN_RTT=$rtt; }
         CL_HEADER="${CL_HEADER}
 # ${dir_name}${CL_COUNT}: ${ln} | ${bw}Mbps | RTT ${rtt}ms | BDP $(( bdp / 1024 ))KB"
         echo ""; confirm_action "还有更多${dir_name}?" || break; echo ""
@@ -144,25 +147,32 @@ calculate_and_generate() {
     local bdp=$bdp_up; [ $bdp_dn -gt $bdp ] && bdp=$bdp_dn
     local mbw=$up_bw; [ $down_bw -gt $mbw ] && mbw=$down_bw
 
-    # 缓冲区 (YouTube流媒体优化: 4倍BDP, 更高下限)
-    local def=$(( (bdp / 65536 + 1) * 65536 ))
-    [ $def -lt 262144 ] && def=262144; [ $def -gt 4194304 ] && def=4194304
+    # 缓冲区 (Fix: def下限提升为max/8，上限从4MB提高到16MB，避免高带宽下首包吞吐差)
     local max=$(( (bdp * 4 + 1048575) / 1048576 * 1048576 ))
     [ $max -lt 2097152 ] && max=2097152; [ $max -gt 268435456 ] && max=268435456
+    local def=$(( (bdp / 65536 + 1) * 65536 ))
+    [ $def -lt 262144 ] && def=262144
+    [ $def -lt $(( max / 8 )) ] && def=$(( max / 8 ))   # Fix: 确保def不低于max/8
+    [ $def -gt 16777216 ] && def=16777216                # Fix: 上限16MB而非4MB
     [ $def -gt $(( max / 2 )) ] && def=$(( max / 2 ))
 
-    # tcp_mem (宽裕模式: 提高阈值避免内存压力丢包)
+    # tcp_mem (Fix: 加内存上限保护，防止高带宽下mh超出物理内存触发OOM)
     get_meminfo
     local pg=$(( MEM_AVAIL_KB / 4 ))
     local ml=$(( pg * 5 / 100 )) mp=$(( pg * 10 / 100 )) mh=$(( pg * 15 / 100 ))
     local mnh=$(( max * 2 / 1024 * 50 / 4 ))
+    # Fix: mnh不能超过物理内存15%对应的pages，防止OOM
+    local mem_page_limit=$(( MEM_TOTAL_KB * 1024 / 4096 * 15 / 100 ))
+    [ $mnh -gt $mem_page_limit ] && mnh=$mem_page_limit
     [ $mh -lt $mnh ] && mh=$mnh
     [ $mp -lt $(( mh * 6 / 10 )) ] && mp=$(( mh * 6 / 10 ))
     [ $ml -lt $(( mh * 3 / 10 )) ] && ml=$(( mh * 3 / 10 ))
     [ $ml -lt 65536 ] && ml=65536; [ $mp -lt 131072 ] && mp=131072; [ $mh -lt 262144 ] && mh=262144
 
-    # 动态参数 (YouTube优化: 秒开+大突发+稳定)
-    local lowat=$(clamp $(( mbw * 64 )) 8192 262144)
+    # 动态参数
+    # Fix: lowat下限改为自适应，低带宽不强制8192浪费
+    local lowat_min=$(( mbw * 32 )); [ $lowat_min -lt 4096 ] && lowat_min=4096
+    local lowat=$(clamp $(( mbw * 64 )) $lowat_min 262144)
     local smc=$(clamp $(( mbw * 80 )) 2048 65535)
     local synbl=$(clamp $(( mbw * 48 )) 1024 262144)
     local ndbl=$(clamp $(( mbw * 96 )) 2000 1048576)
@@ -171,11 +181,14 @@ calculate_and_generate() {
     local fmax=$(clamp $(( mbw * 2048 )) 131072 10485760)
     local udpr=$(clamp $(( bdp / 4 )) 32768 1048576)
     local udpml=$(( udpr * 2 / 4096 )); [ $udpml -lt 8192 ] && udpml=8192
-    local fin=$(clamp $(( 30 - mbw / 200 )) 10 30)
+    # Fix: fin_timeout公式改为 /50，中等带宽下才有实际变化
+    local fin=$(clamp $(( 30 - mbw / 50 )) 10 30)
     local omem=$(clamp $(( mbw * 128 )) 131072 2097152)
-    local ndb=$(clamp $(( mbw * 2 + 600 )) 600 4000)
+    # Fix: netdev_budget上限从4000提高到8000，支持4Gbps
+    local ndb=$(clamp $(( mbw * 2 + 600 )) 600 8000)
     local dw=$(clamp $(( mbw / 8 + 64 )) 64 256)
-    local bp=0 br=0; [ $mbw -ge 20 ] && { bp=$(clamp $(( mbw / 10 )) 50 200); br=$bp; }
+    # Fix: busy_poll改为线性过渡，低带宽用较小值，从/5开始
+    local bp=0 br=0; [ $mbw -ge 20 ] && { bp=$(clamp $(( mbw / 5 )) 20 200); br=$bp; }
     local initcwnd=$(clamp $(( mbw / 10 + 30 )) 30 128)
 
     cat << EOF
@@ -227,7 +240,7 @@ net.ipv4.tcp_base_mss = 1460
 
 # --- TCP行为 (稳定优先) ---
 net.ipv4.tcp_rfc1337 = 1
-net.ipv4.tcp_fastopen = 1
+net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = $fin
 net.ipv4.tcp_keepalive_time = 30
@@ -329,11 +342,12 @@ apply_temp_boost() {
         net.core.wmem_max \
         net.core.rmem_default \
         net.core.wmem_default \
-        net.ipv4.tcp_rmem \
-        net.ipv4.tcp_wmem \
         net.ipv4.tcp_window_scaling \
         net.ipv4.tcp_slow_start_after_idle \
         net.ipv4.tcp_no_metrics_save 2>/dev/null)
+    # Fix: 单独保存 tcp_rmem/wmem，避免多值字段在数组中格式错乱
+    ORIG_TCP_RMEM=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)
+    ORIG_TCP_WMEM=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null)
     # 临时写入极限值(sysctl -w 仅运行时，重启即失效)
     sysctl -w \
         net.core.default_qdisc=fq \
@@ -368,12 +382,13 @@ rollback_temp_boost() {
         net.core.wmem_max="${vals[3]}" \
         net.core.rmem_default="${vals[4]}" \
         net.core.wmem_default="${vals[5]}" \
-        "net.ipv4.tcp_rmem=${vals[6]}" \
-        "net.ipv4.tcp_wmem=${vals[7]}" \
-        net.ipv4.tcp_window_scaling="${vals[8]}" \
-        net.ipv4.tcp_slow_start_after_idle="${vals[9]}" \
-        net.ipv4.tcp_no_metrics_save="${vals[10]}" \
+        net.ipv4.tcp_window_scaling="${vals[6]}" \
+        net.ipv4.tcp_slow_start_after_idle="${vals[7]}" \
+        net.ipv4.tcp_no_metrics_save="${vals[8]}" \
         >/dev/null 2>&1
+    # Fix: 用单独保存的变量恢复 tcp_rmem/wmem，格式正确
+    [ -n "$ORIG_TCP_RMEM" ] && sysctl -w "net.ipv4.tcp_rmem=$ORIG_TCP_RMEM" >/dev/null 2>&1
+    [ -n "$ORIG_TCP_WMEM" ] && sysctl -w "net.ipv4.tcp_wmem=$ORIG_TCP_WMEM" >/dev/null 2>&1
     echo -e "  ${DIM}已回滚临时参数${NC}"
 }
 
