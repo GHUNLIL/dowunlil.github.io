@@ -2,13 +2,10 @@
 # ============================================================
 # 专线网络优化工具 v3.2 (Bug修复版)
 # 功能: BBR/sysctl优化 + initcwnd秒开 + 链路向导 + 国家白名单 + 端口监控
-# 修复: tcp_mem OOM / def缓冲封顶 / MemAvailable / tcp_fastopen=3
-#       fin_timeout公式 / lowat自适应 / netdev_budget上限 / busy_poll线性
-#       rollback tcp_rmem/wmem格式 / collect_lines冗余行
 # 用法: sudo bash bbr.sh [命令]
 # ============================================================
 
-VERSION="v3.2"
+VERSION="v3.3"
 CONFIG_DIR="/etc/network-optimizer"
 SYSCTL_CONF="$CONFIG_DIR/sysctl-optimize.conf"
 PROFILE_CONF="$CONFIG_DIR/profile.conf"
@@ -173,7 +170,7 @@ calculate_and_generate() {
     # Fix: lowat下限改为自适应，低带宽不强制8192浪费
     local lowat_min=$(( mbw * 32 )); [ $lowat_min -lt 4096 ] && lowat_min=4096
     local lowat=$(clamp $(( mbw * 64 )) $lowat_min 262144)
-    local smc=$(clamp $(( mbw * 80 )) 2048 65535)
+    local smc=$(clamp $(( mbw * 80 )) 512 65535)
     local synbl=$(clamp $(( mbw * 48 )) 1024 262144)
     local ndbl=$(clamp $(( mbw * 96 )) 2000 1048576)
     local tw=$(clamp $(( mbw * 5000 )) 131072 16000000)
@@ -189,7 +186,7 @@ calculate_and_generate() {
     local dw=$(clamp $(( mbw / 8 + 64 )) 64 256)
     # Fix: busy_poll改为线性过渡，低带宽用较小值，从/5开始
     local bp=0 br=0; [ $mbw -ge 20 ] && { bp=$(clamp $(( mbw / 5 )) 20 200); br=$bp; }
-    local initcwnd=$(clamp $(( mbw / 10 + 30 )) 30 128)
+    local initcwnd=$(clamp $(( mbw / 5 + 10 )) 10 128)
 
     cat << EOF
 # ============================================================
