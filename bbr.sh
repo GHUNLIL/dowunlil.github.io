@@ -2,6 +2,7 @@
 # ============================================================
 # 专线网络优化工具 v3.2 (Bug修复版)
 # 功能: BBR/sysctl优化 + initcwnd秒开 + 链路向导 + 国家白名单 + 端口监控
+# wget -O bbr.sh https://raw.githubusercontent.com/GHUNLIL/dowunlil.github.io/main/bbr.sh && chmod +x bbr.sh && sudo bash bbr.sh
 # 用法: sudo bash bbr.sh [命令]
 # ============================================================
 
