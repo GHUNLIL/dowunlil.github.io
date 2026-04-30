@@ -1,58 +1,77 @@
 #!/bin/bash
 
-#===============#
-#  配置参数区域  #
-#===============#
+#=====================#
+#  1. Configuration   #
+#=====================#
 
-TARGET_IP="10.22.1.112"
+TARGET_IP="IX的IP"
 PORT_START=23
 PORT_END=65535
 
-# 获取本机出口 IP
-LOCAL_IP=$(ip route get 1 | awk '{print $7; exit}')
+echo "-----------------------------------"
+echo "Target IP: $TARGET_IP"
+echo "Port Range: $PORT_START-$PORT_END (TCP & UDP)"
+echo "Mode: nftables (Modern Kernel Forwarding)"
+echo "-----------------------------------"
 
-echo "本地出口IP: $LOCAL_IP"
-echo "目标IP: $TARGET_IP"
-echo "端口范围: $PORT_START-$PORT_END"
+#=====================#
+#  2. Kernel Tuning   #
+#=====================#
 
-#===============#
-#  开启 IP 转发  #
-#===============#
+echo "Forcing IP Forwarding at Kernel Level..."
+echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ipforward.conf
+sysctl -p /etc/sysctl.d/99-ipforward.conf > /dev/null
 
-echo "开启 IP 转发..."
-echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
-sysctl -p
+#=====================#
+#  3. Install nftables#
+#=====================#
 
-#===============#
-#  添加转发规则  #
-#===============#
+echo "Installing and enabling nftables..."
+if [ -x "$(command -v apt)" ]; then
+    apt update -yqq && apt install -y nftables
+elif [ -x "$(command -v yum)" ]; then
+    yum install -y nftables
+fi
 
-echo "添加 iptables 规则..."
+systemctl enable nftables
+systemctl start nftables
 
-# 清除旧规则（可选）
-iptables -t nat -F
+#=====================#
+#  4. Apply Rules     #
+#=====================#
 
-# PREROUTING 规则（进入流量 → 目标 IP）
-iptables -t nat -A PREROUTING -p tcp --dport ${PORT_START}:${PORT_END} -j DNAT --to-destination ${TARGET_IP}
-iptables -t nat -A PREROUTING -p udp --dport ${PORT_START}:${PORT_END} -j DNAT --to-destination ${TARGET_IP}
+echo "Writing native nftables rules..."
 
-# POSTROUTING（出站 SNAT，让回包走 VPS）
-iptables -t nat -A POSTROUTING -p tcp -d ${TARGET_IP} --dport ${PORT_START}:${PORT_END} -j SNAT --to-source ${LOCAL_IP}
-iptables -t nat -A POSTROUTING -p udp -d ${TARGET_IP} --dport ${PORT_START}:${PORT_END} -j SNAT --to-source ${LOCAL_IP}
+# Generate the nftables configuration file
+cat > /etc/nftables.conf <<EOF
+#!/usr/sbin/nft -f
 
-#===============#
-#   保存规则     #
-#===============#
+flush ruleset
 
-echo "保存规则到 /etc/iptables.up.rules ..."
-iptables-save > /etc/iptables.up.rules
+table ip filter {
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+    }
+}
 
-# 自动加载（Debian）
-cat >/etc/network/if-pre-up.d/iptables <<EOF
-#!/bin/sh
-iptables-restore < /etc/iptables.up.rules
+table ip nat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        tcp dport ${PORT_START}-${PORT_END} dnat to ${TARGET_IP}
+        udp dport ${PORT_START}-${PORT_END} dnat to ${TARGET_IP}
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip daddr ${TARGET_IP} tcp dport ${PORT_START}-${PORT_END} masquerade
+        ip daddr ${TARGET_IP} udp dport ${PORT_START}-${PORT_END} masquerade
+    }
+}
 EOF
 
-chmod +x /etc/network/if-pre-up.d/iptables
+echo "Loading rules into kernel..."
+nft -f /etc/nftables.conf
 
-echo "配置完成！规则已永久生效。"
+echo "==================================="
+echo "nftables configuration forced and applied!"
+echo "==================================="
