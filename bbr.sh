@@ -1,12 +1,11 @@
 #!/bin/bash
 # ============================================================
-# 专线网络优化工具 v3.2 (Bug修复版)
-# 功能: BBR/sysctl优化 + initcwnd秒开 + 链路向导 + 国家白名单 + 端口监控
+# 专线网络优化工具 v4.0
 # wget -O bbr.sh https://raw.githubusercontent.com/GHUNLIL/dowunlil.github.io/main/bbr.sh && chmod +x bbr.sh && sudo bash bbr.sh
 # 用法: sudo bash bbr.sh [命令]
 # ============================================================
 
-VERSION="v3.3"
+VERSION="v4.0"
 CONFIG_DIR="/etc/network-optimizer"
 SYSCTL_CONF="$CONFIG_DIR/sysctl-optimize.conf"
 PROFILE_CONF="$CONFIG_DIR/profile.conf"
@@ -145,22 +144,23 @@ calculate_and_generate() {
     local bdp=$bdp_up; [ $bdp_dn -gt $bdp ] && bdp=$bdp_dn
     local mbw=$up_bw; [ $down_bw -gt $mbw ] && mbw=$down_bw
 
-    # 缓冲区 (Fix: def下限提升为max/8，上限从4MB提高到16MB，避免高带宽下首包吞吐差)
-    local max=$(( (bdp * 4 + 1048575) / 1048576 * 1048576 ))
-    [ $max -lt 2097152 ] && max=2097152; [ $max -gt 268435456 ] && max=268435456
+    # 缓冲区 (超激进: BDP×8 给中转多流并发预留余量，下限 16MB 而非 2MB)
+    local max=$(( (bdp * 8 + 1048575) / 1048576 * 1048576 ))
+    [ $max -lt 16777216 ] && max=16777216                 # 超激进: 下限 16MB（原 2MB）
+    [ $max -gt 536870912 ] && max=536870912                # 上限 512MB
     local def=$(( (bdp / 65536 + 1) * 65536 ))
-    [ $def -lt 262144 ] && def=262144
-    [ $def -lt $(( max / 8 )) ] && def=$(( max / 8 ))   # Fix: 确保def不低于max/8
-    [ $def -gt 16777216 ] && def=16777216                # Fix: 上限16MB而非4MB
+    [ $def -lt 1048576 ] && def=1048576                    # 超激进: def 下限 1MB（原 256KB）
+    [ $def -lt $(( max / 4 )) ] && def=$(( max / 4 ))     # def 不低于 max/4
+    [ $def -gt 33554432 ] && def=33554432                  # 上限 32MB
     [ $def -gt $(( max / 2 )) ] && def=$(( max / 2 ))
 
-    # tcp_mem (Fix: 加内存上限保护，防止高带宽下mh超出物理内存触发OOM)
+    # tcp_mem 激进版: 可用内存的 25%/50%/75%（不再保守，充分利用内存跑满带宽）
     get_meminfo
     local pg=$(( MEM_AVAIL_KB / 4 ))
-    local ml=$(( pg * 5 / 100 )) mp=$(( pg * 10 / 100 )) mh=$(( pg * 15 / 100 ))
+    local ml=$(( pg * 25 / 100 )) mp=$(( pg * 50 / 100 )) mh=$(( pg * 75 / 100 ))
     local mnh=$(( max * 2 / 1024 * 50 / 4 ))
-    # Fix: mnh不能超过物理内存15%对应的pages，防止OOM
-    local mem_page_limit=$(( MEM_TOTAL_KB * 1024 / 4096 * 15 / 100 ))
+    # Fix: mnh不能超过物理内存75%对应的pages，防止OOM
+    local mem_page_limit=$(( MEM_TOTAL_KB * 1024 / 4096 * 75 / 100 ))
     [ $mnh -gt $mem_page_limit ] && mnh=$mem_page_limit
     [ $mh -lt $mnh ] && mh=$mnh
     [ $mp -lt $(( mh * 6 / 10 )) ] && mp=$(( mh * 6 / 10 ))
@@ -168,26 +168,47 @@ calculate_and_generate() {
     [ $ml -lt 65536 ] && ml=65536; [ $mp -lt 131072 ] && mp=131072; [ $mh -lt 262144 ] && mh=262144
 
     # 动态参数
-    # Fix: lowat下限改为自适应，低带宽不强制8192浪费
+    # 秒开缓存激进: lowat=mbw×256，高RTT线路需要更大写缓存流水线化
     local lowat_min=$(( mbw * 32 )); [ $lowat_min -lt 4096 ] && lowat_min=4096
-    local lowat=$(clamp $(( mbw * 64 )) $lowat_min 262144)
+    local lowat=$(clamp $(( mbw * 256 )) $lowat_min 1048576)
     local smc=$(clamp $(( mbw * 80 )) 512 65535)
     local synbl=$(clamp $(( mbw * 48 )) 1024 262144)
     local ndbl=$(clamp $(( mbw * 96 )) 2000 1048576)
     local tw=$(clamp $(( mbw * 5000 )) 131072 16000000)
     local orph=$(clamp $(( mbw * 160 )) 4096 524288)
     local fmax=$(clamp $(( mbw * 2048 )) 131072 10485760)
-    local udpr=$(clamp $(( bdp / 4 )) 32768 1048576)
-    local udpml=$(( udpr * 2 / 4096 )); [ $udpml -lt 8192 ] && udpml=8192
+    # UDP 单socket缓冲: 激进版，按 BDP/2 算，下限 256KB 上限 8MB（高并发 UDP 中转专用）
+    local udpr=$(clamp $(( bdp / 2 )) 262144 8388608)
+    # UDP 内存池激进版: 占可用内存 30%（IXP/转发节点 UDP 流量大），三级阈值 50%/75%/100%
+    local udp_max_pages=$(( MEM_AVAIL_KB * 1024 / 4096 * 30 / 100 ))
+    [ $udp_max_pages -lt 262144 ] && udp_max_pages=262144   # 保底 1GB pages
+    local udpml=$(( udp_max_pages / 2 ))                    # min: 50% 才开始 pressure
+    local udpmm=$(( udp_max_pages * 3 / 4 ))                # pressure: 75%
+    local udpmax=$udp_max_pages                             # max: 100%
+
+    # nf_conntrack 连接跟踪池按内存动态算，防转发丢包
+    local nfconn=$(clamp $(( MEM_TOTAL_KB / 2 )) 1048576 8388608)
+
+    # RPS 检测：网卡队列数
+    local iface_rps=$(detect_interface)
+    local queue_count=1
+    [ -n "$iface_rps" ] && queue_count=$(ls -d /sys/class/net/$iface_rps/queues/rx-* 2>/dev/null | wc -l)
+    [ $queue_count -lt 1 ] && queue_count=1
+    local cpu_cores=$(nproc 2>/dev/null || echo 1)
     # Fix: fin_timeout公式改为 /50，中等带宽下才有实际变化
     local fin=$(clamp $(( 30 - mbw / 50 )) 10 30)
     local omem=$(clamp $(( mbw * 128 )) 131072 2097152)
     # Fix: netdev_budget上限从4000提高到8000，支持4Gbps
     local ndb=$(clamp $(( mbw * 2 + 600 )) 600 8000)
-    local dw=$(clamp $(( mbw / 8 + 64 )) 64 256)
-    # Fix: busy_poll改为线性过渡，低带宽用较小值，从/5开始
-    local bp=0 br=0; [ $mbw -ge 20 ] && { bp=$(clamp $(( mbw / 5 )) 20 200); br=$bp; }
-    local initcwnd=$(clamp $(( mbw / 5 + 10 )) 10 128)
+    # dev_weight 激进: 高带宽需要更大单次收包量
+    local dw=$(clamp $(( mbw / 8 + 64 )) 64 512)
+    # busy_poll: 只用于低延迟(<10ms)机房，高RTT下开它反而浪费CPU
+    local bp=0 br=0
+    if [ "$up_rtt" -le 10 ] && [ "$down_rtt" -le 10 ] 2>/dev/null; then
+        [ $mbw -ge 20 ] && { bp=$(clamp $(( mbw / 5 )) 20 200); br=$bp; }
+    fi
+    # initcwnd 直接拉到内核硬上限 128 (Linux 4.x+ 上限) — YouTube/Netflix/CDN 标配
+    local initcwnd=128
 
     cat << EOF
 # ============================================================
@@ -218,15 +239,25 @@ net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_autocorking = 0
+net.ipv4.tcp_autocorking = 1
 
 # --- 重传 (跨国链路优化) ---
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_fack = 1
 net.ipv4.tcp_frto = 2
 net.ipv4.tcp_early_retrans = 3
 net.ipv4.tcp_retries2 = 8
 net.ipv4.tcp_orphan_retries = 2
+# RACK + 时间戳乱序检测，跨国链路必备
+net.ipv4.tcp_recovery = 1
+# 容忍跨国乱序，避免触发不必要重传
+net.ipv4.tcp_max_reordering = 1000
+# 失败连接快速放弃，省 SYN 等待
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 2
+# 小流(视频信令、控制流)快速恢复
+net.ipv4.tcp_thin_linear_timeouts = 1
 
 # --- ECN (关闭避免兼容性问题) ---
 net.ipv4.tcp_ecn = 0
@@ -235,6 +266,7 @@ net.ipv4.tcp_ecn_fallback = 1
 # --- MTU ---
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_base_mss = 1460
+net.ipv4.tcp_min_snd_mss = 536
 
 # --- TCP行为 (稳定优先) ---
 net.ipv4.tcp_rfc1337 = 1
@@ -244,10 +276,19 @@ net.ipv4.tcp_fin_timeout = $fin
 net.ipv4.tcp_keepalive_time = 30
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 3
+# BBR pacing 激进版: 慢启动阶段 200% 速率，巡航阶段 120%（YouTube 视频流必备）
+net.ipv4.tcp_pacing_ss_ratio = 200
+net.ipv4.tcp_pacing_ca_ratio = 120
+# 单流 qdisc 输出限制拉到 4MB（默认 1MB 卡 4K视频）
+net.ipv4.tcp_limit_output_bytes = 4194304
+# 防 RST 攻击但不限速合法流量
+net.ipv4.tcp_challenge_ack_limit = 999999
+# 不限速无效 ACK（抖动场景关闭限速更稳）
+net.ipv4.tcp_invalid_ratelimit = 0
 
-# --- 连接队列 ---
-net.core.somaxconn = $smc
-net.ipv4.tcp_max_syn_backlog = $synbl
+# --- 连接队列 (全部拉满) ---
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65536
 net.core.netdev_max_backlog = $ndbl
 net.ipv4.tcp_max_tw_buckets = $tw
 net.ipv4.ip_local_port_range = 1024 65535
@@ -255,16 +296,21 @@ net.ipv4.tcp_max_orphans = $orph
 
 # --- 网卡调度 ---
 net.core.netdev_budget = $ndb
+net.core.netdev_budget_usecs = 8000
 net.core.dev_weight = $dw
 net.core.busy_poll = $bp
 net.core.busy_read = $br
+# RPS 流表拉大，多核分流更细
+net.core.flow_limit_table_len = 8192
 
-# --- UDP ---
+# --- UDP (激进 - 视频/语音/QUIC 大池) ---
 net.ipv4.udp_rmem_min = $udpr
 net.ipv4.udp_wmem_min = $udpr
-net.ipv4.udp_mem = $udpml $(( udpml * 2 )) $(( udpml * 4 ))
+net.ipv4.udp_mem = $udpml $udpmm $udpmax
+# UDP 早期分段重组（QUIC/HTTP3 必备）
+net.ipv4.udp_l3mdev_accept = 0
 
-# --- 转发 ---
+# --- 转发与 nf_conntrack 防丢包 ---
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
@@ -277,15 +323,180 @@ net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
+net.netfilter.nf_conntrack_max = $nfconn
+net.netfilter.nf_conntrack_buckets = $(( nfconn / 4 ))
+net.netfilter.nf_conntrack_tcp_timeout_established = 1200
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 120
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 120
 
-# --- 系统 ---
+# --- 系统 (拉满) ---
 vm.swappiness = 1
 vm.vfs_cache_pressure = 50
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
 fs.file-max = $fmax
+fs.nr_open = 1073741816
 
 # --- initcwnd (秒开核心, 通过ip route设置) ---
 # initcwnd=$initcwnd initrwnd=$initcwnd
 EOF
+}
+
+# RPS 自动配置（多核负载均衡）
+apply_rps() {
+    local iface=$(detect_interface)
+    [ -z "$iface" ] && return
+    local qc=$(ls -d /sys/class/net/$iface/queues/rx-* 2>/dev/null | wc -l)
+    [ -z "$qc" ] && qc=1
+    local cc=$(nproc 2>/dev/null || echo 1)
+    [ "$qc" -ge "$cc" ] && return
+    [ "$cc" -lt 2 ] && return
+
+    echo ""
+    echo -e "  ${BOLD}${YELLOW}━━━ 多核负载均衡 (RPS) ━━━${NC}"
+    echo -e "  ${DIM}网卡 ${qc}队列 < CPU ${cc}核，自动开启 RPS 分散中断${NC}"
+    echo ""
+
+    local mask=$(printf '%x' $(( (1 << cc) - 1 )))
+
+    # 配满 rps_sock_flow_entries（全局）
+    echo 65536 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null
+
+    # 每个队列配 rps_cpus + rps_flow_cnt
+    for ((i=0; i<qc; i++)); do
+        local rx="/sys/class/net/${iface}/queues/rx-${i}"
+        [ -d "$rx" ] || continue
+        echo "$mask" > "$rx/rps_cpus" 2>/dev/null && echo -e "  ${GREEN}✓${NC} rx-${i} → CPU mask ${mask}"
+        echo 4096 > "$rx/rps_flow_cnt" 2>/dev/null
+    done
+
+    # 持久化到 rc.local
+    if ! grep -q "rps_cpus" /etc/rc.local 2>/dev/null; then
+        [ ! -f /etc/rc.local ] && echo "#!/bin/bash" > /etc/rc.local
+        sed -i '/^exit 0/d' /etc/rc.local 2>/dev/null
+        cat >> /etc/rc.local << EOF
+# RPS 多核负载均衡 (由 bbr-v4.0 自动配置)
+echo 65536 > /proc/sys/net/core/rps_sock_flow_entries
+EOF
+        for ((i=0; i<qc; i++)); do
+            local rx="/sys/class/net/${iface}/queues/rx-${i}"
+            [ -d "$rx" ] || continue
+            echo "echo ${mask} > ${rx}/rps_cpus" >> /etc/rc.local
+            echo "echo 4096 > ${rx}/rps_flow_cnt" >> /etc/rc.local
+        done
+        echo "exit 0" >> /etc/rc.local
+        chmod +x /etc/rc.local
+        echo -e "  ${GREEN}✓${NC} RPS 已写入 /etc/rc.local（开机自启）"
+    else
+        echo -e "  ${DIM}ℹ RPS 配置已存在 rc.local，跳过${NC}"
+    fi
+    echo -e "  ${GREEN}${BOLD}CPU ${cc}核全部参与网络处理，火力全开！${NC}"
+    echo ""
+}
+
+# ==================== iptables 端口转发 ====================
+port_forward_main() {
+    while true; do
+        echo ""
+        local f_status="未配置"; iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT && f_status="运行中"
+        echo -e "  ${BOLD}${CYAN}━━━ 端口转发 (IX/中转/前置) ━━━${NC}"
+        echo -e "  ${DIM}当前状态: ${WHITE}$f_status${NC}"; echo ""
+        select_menu "转发管理" "添加/覆盖全端口转发 (iptables)" "查看当前转发规则" "清空所有转发规则" "返回主菜单"
+        case $? in
+            0) port_forward_setup ;;
+            1) port_forward_status ;;
+            2) port_forward_clear ;;
+            3) return ;;
+        esac
+        echo -ne "  ${DIM}回车继续...${NC}"; read -r
+    done
+}
+
+port_forward_setup() {
+    echo ""; echo -e "  ${BOLD}${CYAN}配置 iptables 端口转发${NC}"; echo ""
+    local tip; echo -ne "  ${WHITE}目标机器IP (如 103.177.x.x): ${NC}"; read tip
+    [[ "$tip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo -e "  ${RED}无效IP格式${NC}"; return; }
+    local ps; read_int "本机起始端口 (建议避开22, 推荐23)" "23" "ps"
+    local pe; read_int "本机结束端口" "65535" "pe"
+    echo ""
+    echo -e "  ${DIM}目标端口范围 (可回车默认同端口, 或填不同范围如 10000-11000)${NC}"
+    local tport=""
+    while [ -z "$tport" ]; do
+        echo -ne "  ${WHITE}目标端口范围 [默认 ${ps}-${pe}]: ${NC}"; read tport
+        [ -z "$tport" ] && tport="${ps}-${pe}"
+        if echo "$tport" | grep -qP '^\d+[-:]\d+$'; then
+            local ts=$(echo "$tport" | sed 's/-/:/' | cut -d: -f1)
+            local te=$(echo "$tport" | sed 's/-/:/' | cut -d: -f2)
+            [ "$ts" -gt 0 ] 2>/dev/null && [ "$te" -ge "$ts" ] 2>/dev/null && break
+        fi
+        echo -e "  ${RED}无效格式，请输入如 10000-11000${NC}"
+        tport=""
+    done
+    # 统一转成冒号格式（iptables 用 23:65535，不支持 23-65535）
+    local tport_ipt=$(echo "$tport" | sed 's/-/:/g')
+    local ps_ipt=$(echo "${ps}-${pe}" | sed 's/-/:/g')
+    local lip=$(ip -4 route get 223.5.5.5 2>/dev/null | awk '{print $7; exit}')
+    [ -z "$lip" ] && lip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
+    echo -e "  ${DIM}-----------------------------------"
+    echo -e "  本机IP:     $lip"
+    echo -e "  本机端口:   $ps-$pe"
+    echo -e "  目标机IP:   $tip"
+    echo -e "  目标端口:   $tport"
+    echo -e "  协议:       TCP & UDP"
+    echo -e "  -----------------------------------${NC}"
+    confirm_action "确认执行配置?" || return
+    echo -e "  ${DIM}→ 开启 IP 转发...${NC}"
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    echo -e "  ${DIM}→ 注入 iptables 规则...${NC}"
+    # 先删旧的同目标规则再添加，避免重复
+    iptables -t nat -D PREROUTING -p tcp --dport "$ps_ipt" -j DNAT --to-destination "${tip}:${tport_ipt}" 2>/dev/null || true
+    iptables -t nat -D PREROUTING -p udp --dport "$ps_ipt" -j DNAT --to-destination "${tip}:${tport_ipt}" 2>/dev/null || true
+    iptables -D FORWARD -p tcp -d "$tip" --dport "$tport_ipt" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -p udp -d "$tip" --dport "$tport_ipt" -j ACCEPT 2>/dev/null || true
+    iptables -I FORWARD -p tcp -d "$tip" --dport "$tport_ipt" -j ACCEPT
+    iptables -I FORWARD -p udp -d "$tip" --dport "$tport_ipt" -j ACCEPT
+    # DNAT: 同端口转发直接到IP，不同端口需指定目标端口
+    if [ "$tport_ipt" = "$ps_ipt" ]; then
+        iptables -t nat -A PREROUTING -p tcp --dport "$ps_ipt" -j DNAT --to-destination "$tip"
+        iptables -t nat -A PREROUTING -p udp --dport "$ps_ipt" -j DNAT --to-destination "$tip"
+    else
+        # nf_tables 不支持 DNAT IP:port-range，转用 iptables-legacy
+        if command -v iptables-legacy >/dev/null 2>&1; then
+            iptables-legacy -t nat -A PREROUTING -p tcp --dport "$ps":"$pe" -j DNAT --to-destination "${tip}:${tport}"
+            iptables-legacy -t nat -A PREROUTING -p udp --dport "$ps":"$pe" -j DNAT --to-destination "${tip}:${tport}"
+        else
+            echo -e "  ${YELLOW}⚠ 不同端口转发需 iptables-legacy，当前不支持${NC}"
+            echo -e "  ${DIM}  建议: apt install iptables-legacy 或手动配置${NC}"
+        fi
+    fi
+    iptables -t nat -A POSTROUTING -p tcp -d "$tip" --dport "$tport_ipt" -j MASQUERADE
+    iptables -t nat -A POSTROUTING -p udp -d "$tip" --dport "$tport_ipt" -j MASQUERADE
+    echo -e "  ${DIM}→ 保存并配置开机加载...${NC}"
+    mkdir -p /etc/network/if-pre-up.d
+    iptables-save > /etc/iptables.up.rules
+    cat >/etc/network/if-pre-up.d/iptables <<EOF
+#!/bin/sh
+iptables-restore < /etc/iptables.up.rules
+EOF
+    chmod +x /etc/network/if-pre-up.d/iptables
+    echo -e "  ${GREEN}✓ 配置成功！流量已无损转发至 $tip${NC}"
+}
+
+port_forward_status() {
+    echo ""; echo -e "  ${BOLD}${CYAN}当前 NAT 转发规则:${NC}"
+    echo -e "  ${DIM}PREROUTING (入口转换):${NC}"
+    iptables -t nat -nL PREROUTING --line-numbers | grep DNAT || echo "  无"
+    echo -e "  ${DIM}POSTROUTING (出口伪装):${NC}"
+    iptables -t nat -nL POSTROUTING --line-numbers | grep -E "SNAT|MASQUERADE" || echo "  无"
+    echo ""
+}
+
+port_forward_clear() {
+    confirm_action "确定清空所有 iptables NAT 转发规则?" || return
+    iptables -t nat -F
+    rm -f /etc/iptables.up.rules /etc/network/if-pre-up.d/iptables
+    echo -e "  ${GREEN}✓ 转发规则已清空${NC}"
 }
 
 # ==================== 应用配置 ====================
@@ -310,20 +521,33 @@ apply_sysctl_config() {
     fi
     check_memory_and_swap
 
+    # 自动加载内核模块（开机自启）
+    modprobe nf_conntrack 2>/dev/null
+    mkdir -p /etc/modules-load.d
+    echo -e "tcp_bbr\nnf_conntrack" > /etc/modules-load.d/network-optimize.conf
+
     if confirm_action "确认写入并应用?"; then
         init_config_dir
         [ ! -f "$CONFIG_DIR/sysctl-backup.conf" ] && { sysctl -a > "$CONFIG_DIR/sysctl-backup.conf" 2>/dev/null; echo -e "  ${GREEN}✓${NC} 已备份"; }
+        # Too many open files 修复（高并发场景）
+        mkdir -p /etc/security/limits.d
+        echo -e "* soft nofile 1048576\n* hard nofile 1048576\nroot soft nofile 1048576\nroot hard nofile 1048576" > /etc/security/limits.d/99-network-optimize.conf
+        sed -i '/DefaultLimitNOFILE/d' /etc/systemd/system.conf 2>/dev/null
+        echo "DefaultLimitNOFILE=1048576" >> /etc/systemd/system.conf
+        systemctl daemon-reload >/dev/null 2>&1
         echo "$config" > "$SYSCTL_CONF"
         echo "SYSCTL_PROFILE_NAME=\"$role_name\"" > "$PROFILE_CONF"
         ln -sf "$SYSCTL_CONF" /etc/sysctl.d/99-network-optimize.conf
         local err=$(sysctl --system 2>&1 | grep -i "error\|cannot\|invalid" || true)
         [ -n "$err" ] && echo "$err" | head -3 | sed 's/^/    /'
         apply_initcwnd
+        install_initcwnd_enforcer
         echo -e "  ${GREEN}✓${NC} 已生效 | $(sysctl -n net.ipv4.tcp_congestion_control) + $(sysctl -n net.core.default_qdisc)"
     else
         echo -e "  ${DIM}已取消，未写入任何配置${NC}"
     fi
     echo ""
+    apply_rps
 }
 
 # ==================== 一键自动配置 ====================
@@ -476,14 +700,34 @@ auto_max_performance() {
     echo -e "  ${WHITE}BDP:${NC}   ${BOLD}$(( bdp / 1024 ))KB${NC} (${bw}Mbps × ${best_rtt}ms)"
     echo ""
 
-    # ④ 确认测速结果
+    # ④ 手动修正带宽（实测不准时可以填商家宣称值）
+    echo -e "  ${DIM}━━ 带宽确认 ━━${NC}"
+    echo -e "  ${DIM}实测: ${bw}Mbps | 如果你想用商家宣称值/自己填，可以修改${NC}"
+    if confirm_action "实测 ${bw}Mbps，接受此值?"; then
+        : # 保持 bw 不变
+    else
+        echo ""
+        local manual_bw=""
+        while [ -z "$manual_bw" ]; do
+            echo -ne "  ${WHITE}手动输入带宽 (Mbps) [推荐 300]: ${NC}"
+            read manual_bw
+            [[ "$manual_bw" =~ ^[0-9]+$ ]] && [ "$manual_bw" -gt 0 ] && { bw=$manual_bw; break; }
+            echo -e "  ${RED}请输入正整数${NC}"
+            manual_bw=""
+        done
+        bdp=$(( bw * best_rtt * 125 ))
+        echo -e "  ${YELLOW}→ 使用手动值: ${bw}Mbps × ${best_rtt}ms = $(( bdp / 1024 ))KB BDP${NC}"
+    fi
+    echo ""
+
+    # ⑤ 确认测速结果
     if ! confirm_action "使用此结果生成配置?"; then
         echo -e "  ${DIM}已取消${NC}"
         rollback_temp_boost
         return
     fi
 
-    # ⑤ 选择服务器角色
+    # ⑥ 选择服务器角色
     echo ""
     echo -e "  ${DIM}用户 → ①前置 → ②IX → ③转发 → ④落地 → 目标${NC}"; echo ""
     select_menu "本机角色" "① 前置服务器 (用户直连入口)" "② IX专线服务器 (上下游中转)" "③ 转发/线路服务器 (国际线路)" "④ 落地服务器 (出口访问目标)" "⑤ 通用 (不区分角色)"
@@ -517,7 +761,11 @@ wizard_main() {
 
 wizard_frontend() {
     echo ""; echo -e "  ${BOLD}${CYAN}━━━ ① 前置服务器 ━━━${NC}"; echo ""
-    local ul ur up; read_int "本机上行 (Mbps)" "" "ul"; read_int "用户带宽 (Mbps)" "" "ur"; read_int "用户到本机ping (ms)" "" "up"
+    echo -e "  ${DIM}多用户共享前置? 用户带宽可留空跳过，直接按本机带宽算${NC}"
+    local ul ur up; read_int "本机上行 (Mbps)" "" "ul"
+    echo -ne "  ${WHITE}用户带宽 (Mbps) [留空=同本机带宽]: ${NC}"; read ur
+    [ -z "$ur" ] && ur=$ul
+    read_int "用户到本机ping (ms)" "" "up"
     local rtt=$(( up * 2 )) bw=$ul; [ $ur -lt $bw ] && bw=$ur
     echo ""; echo -e "  ${WHITE}${BOLD}下游线路${NC}"
     collect_lines "下游" "IX专线/HK线路/SG直连" "$ul" ""
@@ -588,6 +836,12 @@ show_status() {
     local icwnd=$(ip route show default 2>/dev/null | grep -oP 'initcwnd \K[0-9]+' || echo "-")
     echo -e "  initcwnd: ${BOLD}${icwnd}${NC} | ECN: ${BOLD}$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null)${NC} | TFO: ${BOLD}$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)${NC}"
     get_meminfo; echo -e "  内存: ${BOLD}$(( MEM_TOTAL_KB / 1024 ))MB${NC} | Swap: ${BOLD}$(( SWAP_TOTAL_KB / 1024 ))MB${NC}"
+    local ct=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null) cm=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
+    [ -n "$ct" ] && echo -e "  conntrack: ${BOLD}${ct}/${cm}${NC}"
+    local enf=$(systemctl is-active initcwnd-enforcer.timer 2>/dev/null || echo "inactive")
+    echo -e "  守护: ${BOLD}${enf}${NC}"
+    local fwd_status=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT && echo "运行中" || echo "未启用")
+    echo -e "  转发: ${BOLD}${fwd_status}${NC} | Ping: ${BOLD}$(ping_status_str)${NC}"
     echo ""
     if nft list table inet geo_filter >/dev/null 2>&1; then
         [ -f "$GEO_CONF" ] && source "$GEO_CONF"
@@ -595,6 +849,45 @@ show_status() {
         echo -e "  拦截: ${BOLD}$(nft list chain inet geo_filter input 2>/dev/null|grep -oP 'counter packets \K[0-9]+'|tail -1||echo 0)${NC} 包"
     else echo -e "  ${DIM}○ 白名单: 未启用${NC}"; fi
     echo ""; nstat -sz TcpRetransSegs 2>/dev/null | sed 's/^/  /' || true; echo ""
+}
+
+# ==================== initcwnd 守护进程 ====================
+install_initcwnd_enforcer() {
+    cat > /usr/local/bin/enforce-initcwnd.sh << 'EOF'
+#!/bin/bash
+CONF="/etc/network-optimizer/sysctl-optimize.conf"
+[ ! -f "$CONF" ] && exit 0
+ICWND=$(grep -oP 'initcwnd=\K[0-9]+' "$CONF" || echo 30)
+IFACE=$(ip route show default 2>/dev/null | awk '/default/{print $5;exit}')
+[ -z "$IFACE" ] && exit 0
+GW=$(ip route show default dev "$IFACE" 2>/dev/null | awk '/default/{print $3;exit}')
+[ -z "$GW" ] && exit 0
+if ! ip route show default | grep -q "initcwnd $ICWND"; then
+    ip route change default via "$GW" dev "$IFACE" initcwnd "$ICWND" initrwnd "$ICWND" >/dev/null 2>&1
+fi
+EOF
+    chmod +x /usr/local/bin/enforce-initcwnd.sh
+    cat > /etc/systemd/system/initcwnd-enforcer.service << 'EOF'
+[Unit]
+Description=Enforce initcwnd settings
+After=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/enforce-initcwnd.sh
+EOF
+    cat > /etc/systemd/system/initcwnd-enforcer.timer << 'EOF'
+[Unit]
+Description=Run initcwnd enforcer every minute
+[Timer]
+OnBootSec=30sec
+OnUnitActiveSec=1min
+AccuracySec=1sec
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now initcwnd-enforcer.timer >/dev/null 2>&1
+    echo -e "  ${GREEN}✓${NC} initcwnd 守护已启动（每分钟检查，网络断开后自动恢复秒开）"
 }
 
 # ==================== 服务管理 ====================
@@ -626,6 +919,7 @@ toggle_service() {
 service_start() {
     [ -f "$SYSCTL_CONF" ] && sysctl --system >/dev/null 2>&1
     [ -f "$SYSCTL_CONF" ] && apply_initcwnd >/dev/null 2>&1
+    install_initcwnd_enforcer >/dev/null 2>&1
     [ -f "$GEO_NFT" ] && nft -f "$GEO_NFT" 2>/dev/null
 }
 service_stop() { :; }
@@ -645,13 +939,17 @@ reload_network() {
     echo ""
     [ -f "$SYSCTL_CONF" ] && run_cmd "sysctl重载" sysctl --system || echo -e "  ${DIM}无配置${NC}"
     [ -f "$SYSCTL_CONF" ] && apply_initcwnd
+    install_initcwnd_enforcer
     [ -f "$GEO_NFT" ] && run_cmd "白名单重载" nft -f "$GEO_NFT"
     echo -e "  ${GREEN}${BOLD}完成${NC} | $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) rmem$(( $(sysctl -n net.core.rmem_max 2>/dev/null) / 1048576 ))MB"; echo ""
 }
 
 restore_defaults() {
     echo ""; confirm_action "恢复默认? (删除所有优化)" || return
-    rm -f /etc/sysctl.d/99-network-optimize.conf; sysctl --system >/dev/null 2>&1
+    rm -f /etc/sysctl.d/99-network-optimize.conf "$PING_CONF"; sysctl --system >/dev/null 2>&1
+    rm -f /etc/security/limits.d/99-network-optimize.conf
+    systemctl disable --now initcwnd-enforcer.timer >/dev/null 2>&1
+    rm -f /etc/systemd/system/initcwnd-enforcer.* /usr/local/bin/enforce-initcwnd.sh
     for s in network-optimizer geo-whitelist; do systemctl disable ${s}.service 2>/dev/null; rm -f /etc/systemd/system/${s}.service; done
     systemctl daemon-reload 2>/dev/null; nft delete table inet geo_filter 2>/dev/null
     [ -f "$CONFIG_DIR/sysctl-backup.conf" ] && echo -e "  ${DIM}备份保留: $CONFIG_DIR/sysctl-backup.conf${NC}"
@@ -769,6 +1067,70 @@ geo_status() {
 }
 geo_remove() { nft list table inet geo_filter >/dev/null 2>&1 || { echo -e "  ${DIM}未启用${NC}"; return; }; confirm_action "关闭白名单?" && { nft delete table inet geo_filter 2>/dev/null; systemctl disable geo-whitelist.service 2>/dev/null; rm -f /etc/systemd/system/geo-whitelist.service; systemctl daemon-reload 2>/dev/null; echo -e "  ${GREEN}已关闭${NC}"; }; }
 
+# ==================== Ping 控制 (独立) ====================
+PING_CONF="/etc/sysctl.d/97-icmp-control.conf"
+
+ping_status_str() {
+    local v4=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)
+    local v6=$(sysctl -n net.ipv6.icmp.echo_ignore_all 2>/dev/null)
+    [ "$v4" = "1" ] && [ "$v6" = "1" ] && { echo "全禁"; return; }
+    [ "$v4" = "1" ] && [ "$v6" != "1" ] && { echo "禁v4"; return; }
+    [ "$v4" != "1" ] && [ "$v6" = "1" ] && { echo "禁v6"; return; }
+    echo "全允许"
+}
+
+ping_apply() {
+    local v4="$1" v6="$2" label="$3"
+    cat > "$PING_CONF" << EOF
+# ICMP echo control - 由 bbr.sh 管理 ($label)
+net.ipv4.icmp_echo_ignore_all = $v4
+net.ipv6.icmp.echo_ignore_all = $v6
+EOF
+    sysctl -p "$PING_CONF" >/dev/null 2>&1
+    echo -e "  ${GREEN}✓${NC} 已设置: ${BOLD}${label}${NC} (持久化到 $PING_CONF)"
+}
+
+ping_main() {
+    while true; do
+        echo ""
+        echo -e "  ${BOLD}${CYAN}━━━ Ping (ICMP) 控制 ━━━${NC}"
+        echo -e "  ${DIM}独立控制，不依赖白名单${NC}"
+        local cur=$(ping_status_str)
+        case "$cur" in
+            "全禁") echo -e "  ${RED}● 当前: 全禁 (v4+v6 都不响应)${NC}";;
+            "禁v4") echo -e "  ${YELLOW}● 当前: 仅禁 IPv4${NC}";;
+            "禁v6") echo -e "  ${YELLOW}● 当前: 仅禁 IPv6${NC}";;
+            *) echo -e "  ${GREEN}● 当前: 全允许${NC}";;
+        esac
+        echo ""
+        select_menu "Ping 操作" "🚫 禁止 Ping (v4+v6)" "✅ 允许 Ping (v4+v6)" "仅禁 IPv4 (允许 v6)" "仅禁 IPv6 (允许 v4)" "查看当前状态" "返回"
+        case $? in
+            0) ping_apply 1 1 "禁止 v4+v6";;
+            1) ping_apply 0 0 "允许 v4+v6";;
+            2) ping_apply 1 0 "禁 v4 / 允许 v6";;
+            3) ping_apply 0 1 "允许 v4 / 禁 v6";;
+            4) ping_status_show;;
+            5) return;;
+        esac
+        echo -ne "  ${DIM}回车继续...${NC}"; read -r
+    done
+}
+
+ping_status_show() {
+    echo ""
+    echo -e "  ${BOLD}${CYAN}━━━ Ping 当前状态 ━━━${NC}"
+    local v4=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)
+    local v6=$(sysctl -n net.ipv6.icmp.echo_ignore_all 2>/dev/null)
+    echo -e "  IPv4 ICMP echo: ${BOLD}$([ "$v4" = "1" ] && echo "禁止" || echo "允许")${NC} (=$v4)"
+    echo -e "  IPv6 ICMP echo: ${BOLD}$([ "$v6" = "1" ] && echo "禁止" || echo "允许")${NC} (=$v6)"
+    [ -f "$PING_CONF" ] && echo -e "  持久化文件: ${DIM}$PING_CONF${NC}" || echo -e "  ${DIM}无持久化文件 (当前为系统/其他配置默认值)${NC}"
+    if nft list table inet geo_filter >/dev/null 2>&1 && [ -f "$GEO_CONF" ]; then
+        source "$GEO_CONF"
+        echo -e "  ${DIM}白名单内 ping 策略: ${GEO_ALLOW_PING:-yes} (与本独立控制叠加，最严格者生效)${NC}"
+    fi
+    echo ""
+}
+
 # ==================== 端口监控 ====================
 port_monitor() { while true; do echo ""; select_menu "端口监控" "所有端口" "指定端口" "连接排行" "返回"; case $? in 0) port_all;; 1) port_single;; 2) port_rank;; 3) return;; esac; echo -ne "  ${DIM}回车继续...${NC}"; read -r; done; }
 
@@ -801,8 +1163,10 @@ interactive_main() {
         nft list table inet geo_filter >/dev/null 2>&1 && { [ -f "$GEO_CONF" ] && source "$GEO_CONF"; echo -e "  ${GREEN}●${NC} 白名单: ${WHITE}${GEO_COUNTRIES:-启用}${NC}"; } || echo -e "  ${DIM}○ 白名单: 未启用${NC}"
         local al="安装自启"; systemctl is-enabled network-optimizer.service >/dev/null 2>&1 && { echo -e "  ${GREEN}●${NC} 自启: 启用"; al="关闭自启"; } || echo -e "  ${DIM}○ 自启: 未启用${NC}"
         get_meminfo; echo -e "  ${DIM}内存$(( MEM_TOTAL_KB/1024 ))M Swap$(( SWAP_TOTAL_KB/1024 ))M${NC}"; echo ""
-        select_menu "操作" "⚡ 一键自动配置" "手动链路向导" "白名单" "状态" "端口监控" "刷新配置" "$al" "恢复默认" "退出"
-        case $? in 0) auto_max_performance;; 1) wizard_main;; 2) geo_main;continue;; 3) show_status;; 4) port_monitor;continue;; 5) reload_network;; 6) toggle_service;; 7) restore_defaults;; 8) rst;exit 0;; esac
+        local pcur=$(ping_status_str)
+        local plabel="🚫 Ping控制 (当前:${pcur})"
+        select_menu "操作" "⚡ 一键自动配置" "🔄 端口转发" "$plabel" "手动链路向导" "白名单" "状态" "端口监控" "刷新配置" "$al" "恢复默认" "退出"
+        case $? in 0) auto_max_performance;; 1) port_forward_main;; 2) ping_main;continue;; 3) wizard_main;; 4) geo_main;continue;; 5) show_status;; 6) port_monitor;continue;; 7) reload_network;; 8) toggle_service;; 9) restore_defaults;; 10) rst;exit 0;; esac
         echo -ne "  ${DIM}回车返回...${NC}"; read -r
     done
 }
@@ -813,6 +1177,9 @@ case "${1}" in
     auto) auto_max_performance;;
     install) install_service;; restore) restore_defaults;; wizard) wizard_main;;
     geo-update) geo_update;; geo-remove) geo_remove;; geo-status) geo_status;;
+    ping-block) ping_apply 1 1 "禁止 v4+v6";;
+    ping-allow) ping_apply 0 0 "允许 v4+v6";;
+    ping-status) ping_status_show;;
     ports) port_all;; ports-rank) port_rank;; "") interactive_main;;
-    *) echo "$VERSION | $0 [auto|wizard|status|ports|install|restore|geo-update|geo-remove]"; exit 1;;
+    *) echo "$VERSION | $0 [auto|wizard|status|ports|install|restore|geo-update|geo-remove|ping-block|ping-allow|ping-status]"; exit 1;;
 esac
