@@ -5,7 +5,7 @@
 # 用法: sudo bash bbr.sh [命令]
 # ============================================================
 
-VERSION="v4.0"
+VERSION="v1.0"
 CONFIG_DIR="/etc/network-optimizer"
 SYSCTL_CONF="$CONFIG_DIR/sysctl-optimize.conf"
 PROFILE_CONF="$CONFIG_DIR/profile.conf"
