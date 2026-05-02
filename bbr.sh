@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# 专线网络优化工具 v4.0 (RTT精准无修改版 + Systemd现代化版)
+# 专线网络优化工具 v1
 # wget -O bbr.sh https://raw.githubusercontent.com/GHUNLIL/dowunlil.github.io/main/bbr.sh && chmod +x bbr.sh && sudo bash bbr.sh
 # 用法: sudo bash bbr.sh [命令]
 # ============================================================
@@ -54,6 +54,28 @@ get_meminfo() {
     # Fix: 使用 MemAvailable 而非 MemTotal+Swap，避免高估可用内存
     MEM_AVAIL_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null)
     [ -z "$MEM_AVAIL_KB" ] && MEM_AVAIL_KB=$(( MEM_TOTAL_KB / 2 ))
+}
+
+# 检测 BBR 版本 (仅识别，不管理)
+# 写入: BBR_VER (bbr1/bbr3 字符串) BBR_VER_LABEL (含来源说明)
+detect_bbr_version() {
+    local kernel=$(uname -r)
+    local algos=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+    BBR_VER="unknown"
+    BBR_VER_LABEL="未知"
+    if echo "$kernel" | grep -qiE 'xanmod'; then
+        BBR_VER="bbr3"; BBR_VER_LABEL="bbr3 (XanMod)"
+    elif modinfo tcp_bbr 2>/dev/null | grep -qiE '^version:.*[3-9]'; then
+        BBR_VER="bbr3"; BBR_VER_LABEL="bbr3"
+    elif echo "$algos" | grep -qw "bbr3"; then
+        BBR_VER="bbr3"; BBR_VER_LABEL="bbr3"
+    elif echo "$algos" | grep -qw "bbr2"; then
+        BBR_VER="bbr2"; BBR_VER_LABEL="bbr2"
+    elif echo "$algos" | grep -qw "bbr"; then
+        BBR_VER="bbr1"; BBR_VER_LABEL="bbr1 (Linux 主线)"
+    else
+        BBR_VER="none"; BBR_VER_LABEL="不支持 (内核 <4.9)"
+    fi
 }
 
 # ==================== 交互组件 ====================
@@ -214,18 +236,29 @@ check_memory_and_swap() {
 calculate_and_generate() {
     local role_name="$1" up_bw="$2" up_rtt="$3" down_bw="$4" down_rtt="$5" extra_header="$6"
     get_meminfo
+    detect_bbr_version   # 自动识别 BBR1/BBR3，影响下方 ECN 等参数
 
     local bdp_up=$(( up_bw * up_rtt * 125 ))
     local bdp_dn=$(( down_bw * down_rtt * 125 ))
     local bdp=$bdp_up; [ $bdp_dn -gt $bdp ] && bdp=$bdp_dn
     local mbw=$up_bw; [ $down_bw -gt $mbw ] && mbw=$down_bw
 
-    local max=$(( (bdp * 8 + 1048575) / 1048576 * 1048576 ))
+    # BBR3 改进了拥塞响应算法，缓冲倍数可适度收敛 (BBR1=8x, BBR3=6x)
+    # 因为 BBR3 更精准探测带宽，不需要那么多 buffer 余量
+    local bdp_mult=8
+    [ "$BBR_VER" = "bbr3" ] && bdp_mult=6
+    local max=$(( (bdp * bdp_mult + 1048575) / 1048576 * 1048576 ))
     [ $max -lt 16777216 ] && max=16777216
     [ $max -gt 536870912 ] && max=536870912
 
-    local lowat_min=$(( mbw * 32 )); [ $lowat_min -lt 4096 ] && lowat_min=4096
-    local lowat=$(clamp $(( mbw * 256 )) $lowat_min 1048576)
+    # ECN: BBR1 关闭 (老旧路由器兼容)；BBR3 支持精确 ECN，可开启提升性能
+    local ecn_val=0
+    [ "$BBR_VER" = "bbr3" ] && ecn_val=1
+
+    # tcp_notsent_lowat: 应用最多堆 16KB-256KB 未发送数据在内核里，超过则 write() 阻塞
+    # 工业最佳实践 (Cloudflare/Google): 固定低范围而非跟带宽线性放大
+    # 防止高带宽下应用堆 MB 级数据增加应用层延迟
+    local lowat=$(clamp $(( mbw * 64 )) 16384 262144)
 
     local udpr=$bdp
     local udpr_b=$(( mbw * 8192 ))
@@ -252,6 +285,7 @@ calculate_and_generate() {
 # ============================================================
 # ${role_name} - 网络优化配置 (克制版，仅覆盖内核默认不合理项)
 ${extra_header}
+# 内核 BBR 版本: ${BBR_VER_LABEL} -> 适配策略 BDPx${bdp_mult}, ECN=${ecn_val}
 # BDP: ${up_bw}Mx${up_rtt}ms=$(( bdp_up / 1024 ))KB / ${down_bw}Mx${down_rtt}ms=$(( bdp_dn / 1024 ))KB
 # 缓冲上限: ${max} bytes ($(( max / 1048576 ))MB) | 内存 $(( MEM_TOTAL_KB / 1024 ))MB
 # 生成: $VERSION $(date '+%Y-%m-%d %H:%M:%S')
@@ -277,7 +311,8 @@ net.ipv4.tcp_min_rtt_wlen = 60
 
 # --- 跨国链路 ---
 net.ipv4.tcp_max_reordering = 1000
-net.ipv4.tcp_ecn = 0
+# ECN: BBR1 关闭(老旧路由器兼容)，BBR3 开启(精确响应提升性能)
+net.ipv4.tcp_ecn = $ecn_val
 net.ipv4.tcp_mtu_probing = 1
 
 # --- 连接管理 ---
@@ -324,6 +359,9 @@ net.netfilter.nf_conntrack_udp_timeout_stream = 300
 
 # --- 内存 ---
 vm.swappiness = 1
+
+# --- initcwnd 标记 (apply_initcwnd 通过 grep 这一行提取数字，必须保留) ---
+# initcwnd=$initcwnd initrwnd=$initcwnd
 EOF
 }
 
@@ -746,7 +784,8 @@ wizard_relay() {
     done
 
     echo ""; echo -e "  ${WHITE}${BOLD}下游目的地 (本机 -> 落地)${NC}"
-    echo -e "  ${DIM}例: 日本 ping ~30ms / 美西 ping ~80ms / 欧洲 ping ~140ms${NC}"
+    echo -e "  ${DIM}填 ping 命令显示的延迟数字 (RTT，无需换算)${NC}"
+    echo -e "  ${DIM}典型 RTT: 国内同城 5ms / 香港 30ms / 日本 50ms / 美西 150ms / 欧洲 280ms${NC}"
     local dr=0 dr_count=0 dr_log=""
     while true; do
         dr_count=$(( dr_count + 1 ))
@@ -783,7 +822,9 @@ wizard_landing() {
 # ==================== 状态 ====================
 show_status() {
     echo ""; echo -e "  ${BOLD}${CYAN}========== 系统状态 ==========${NC}"
+    detect_bbr_version
     [ -f "$PROFILE_CONF" ] && { source "$PROFILE_CONF"; echo -e "  ${GREEN}[ON]${NC} BBR: ${WHITE}$SYSCTL_PROFILE_NAME${NC}"; } || echo -e "  ${DIM}[--] BBR: 未配置${NC}"
+    echo -e "  内核 BBR 版本: ${BOLD}${BBR_VER_LABEL}${NC} (脚本自动适配)"
     echo -e "  拥塞: ${BOLD}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${NC} | 队列: ${BOLD}$(sysctl -n net.core.default_qdisc 2>/dev/null)${NC}"
     echo -e "  rmem_max: ${BOLD}$(( $(sysctl -n net.core.rmem_max 2>/dev/null) / 1048576 ))MB${NC} | lowat: ${BOLD}$(( $(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null) / 1024 ))KB${NC}"
     local icwnd=$(ip route show default 2>/dev/null | grep -oP 'initcwnd \K[0-9]+' || echo "-")
@@ -843,177 +884,6 @@ EOF
     echo -e "  ${GREEN}[OK]${NC} initcwnd 守护已启动（每分钟检查，网络断开后自动恢复秒开）"
 }
 
-# ==================== BBR 内核管理 (BBR / BBR2 / BBR3) ====================
-
-bbr_detect_version() {
-    local algos=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
-    local current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    local kernel=$(uname -r)
-
-    local bbr_ver="bbr1"
-    if echo "$kernel" | grep -qiE 'xanmod'; then
-        bbr_ver="bbr3 (XanMod)"
-    elif modinfo tcp_bbr 2>/dev/null | grep -qiE 'version.*3'; then
-        bbr_ver="bbr3"
-    elif echo "$algos" | grep -q "bbr2"; then
-        bbr_ver="bbr2"
-    elif echo "$algos" | grep -q "bbr"; then
-        bbr_ver="bbr1 (Linux 主线)"
-    else
-        bbr_ver="未支持"
-    fi
-
-    BBR_VERSION="$bbr_ver"
-    BBR_CURRENT="$current"
-    BBR_KERNEL="$kernel"
-    BBR_AVAILABLE="$algos"
-}
-
-bbr_status_show() {
-    echo ""
-    echo -e "  ${BOLD}${CYAN}BBR 内核状态${NC}"
-    bbr_detect_version
-    echo -e "  当前内核:     ${BOLD}${BBR_KERNEL}${NC}"
-    echo -e "  BBR 版本:     ${BOLD}${BBR_VERSION}${NC}"
-    echo -e "  当前算法:     ${BOLD}${BBR_CURRENT}${NC}"
-    echo -e "  可用算法:     ${DIM}${BBR_AVAILABLE}${NC}"
-    echo ""
-    if echo "$BBR_VERSION" | grep -q "bbr3"; then
-        echo -e "  ${GREEN}[OK]${NC} 已支持 BBR3"
-    elif echo "$BBR_VERSION" | grep -q "bbr2"; then
-        echo -e "  ${YELLOW}[!]${NC} 当前 BBR2，建议升级 BBR3"
-    elif echo "$BBR_VERSION" | grep -q "bbr1"; then
-        echo -e "  ${YELLOW}[!]${NC} 当前 BBR1（Linux 主线版），可升级 BBR3 (XanMod 内核)"
-    else
-        echo -e "  ${RED}[X]${NC} 内核不支持 BBR (需要 >=4.9)"
-    fi
-    echo ""
-}
-
-bbr_install_xanmod() {
-    echo ""; echo -e "  ${BOLD}${CYAN}安装 XanMod 内核 (BBR3)${NC}"; echo ""
-    if ! command -v apt >/dev/null 2>&1; then
-        echo -e "  ${RED}[X] XanMod 仅支持 Debian/Ubuntu 系${NC}"
-        echo -e "  ${DIM}CentOS/RHEL 用户请考虑 ELRepo 或自行编译${NC}"
-        return 1
-    fi
-    echo -e "  ${YELLOW}[!] 警告:${NC}"
-    echo -e "  - 将更换内核，需要重启生效"
-    echo -e "  - 旧内核保留，可在 GRUB 选择回退"
-    echo -e "  - 容器(LXC/OpenVZ)环境无法换内核"
-    echo ""
-    local virt=""
-    if command -v systemd-detect-virt >/dev/null 2>&1; then
-        virt=$(systemd-detect-virt 2>/dev/null)
-    fi
-    if [ "$virt" = "openvz" ] || [ "$virt" = "lxc" ]; then
-        echo -e "  ${RED}[X] 检测到 ${virt} 容器，无法换内核${NC}"
-        return 1
-    fi
-    [ -n "$virt" ] && [ "$virt" != "none" ] && echo -e "  ${DIM}虚拟化: $virt (KVM/Xen 等支持换内核)${NC}"
-    echo ""
-    confirm_action "确认安装 XanMod 内核 (BBR3)?" || return 0
-
-    local cpu_level=""
-    if grep -q ' avx512' /proc/cpuinfo 2>/dev/null; then
-        cpu_level="x64v4"
-    elif grep -qE ' avx2' /proc/cpuinfo 2>/dev/null; then
-        cpu_level="x64v3"
-    elif grep -qE ' sse4_2' /proc/cpuinfo 2>/dev/null; then
-        cpu_level="x64v2"
-    else
-        cpu_level="x64v1"
-    fi
-    echo -e "  ${WHITE}CPU 等级:${NC} ${BOLD}${cpu_level}${NC}"
-
-    echo -e "  ${DIM}1/4 添加 XanMod 仓库密钥...${NC}"
-    wget -qO - https://dl.xanmod.org/archive.key 2>/dev/null | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg 2>/dev/null
-    if [ ! -f /usr/share/keyrings/xanmod-archive-keyring.gpg ]; then
-        echo -e "  ${RED}[X] 下载密钥失败${NC}"
-        return 1
-    fi
-
-    echo -e "  ${DIM}2/4 添加 XanMod APT 源...${NC}"
-    echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' \
-        > /etc/apt/sources.list.d/xanmod-release.list
-
-    echo -e "  ${DIM}3/4 apt update...${NC}"
-    apt update >/dev/null 2>&1 || { echo -e "  ${RED}[X] apt update 失败${NC}"; return 1; }
-
-    echo -e "  ${DIM}4/4 安装 linux-xanmod-${cpu_level}...${NC}"
-    DEBIAN_FRONTEND=noninteractive apt install -y "linux-xanmod-${cpu_level}" 2>&1 | tail -5
-    if dpkg -l | grep -q "linux-xanmod-${cpu_level}"; then
-        echo ""
-        echo -e "  ${GREEN}[OK] XanMod 内核安装成功${NC}"
-        echo -e "  ${YELLOW}[!] 必须重启才能生效，重启后再次运行本脚本应用 BBR3${NC}"
-        echo ""
-        if confirm_action "现在重启?"; then
-            reboot
-        fi
-    else
-        echo -e "  ${RED}[X] 安装失败，检查 /var/log/apt/history.log${NC}"
-        return 1
-    fi
-}
-
-bbr_uninstall_xanmod() {
-    echo ""
-    if ! dpkg -l 2>/dev/null | grep -q "linux-xanmod"; then
-        echo -e "  ${DIM}未检测到 XanMod 内核，无需卸载${NC}"
-        return 0
-    fi
-    confirm_action "卸载 XanMod 内核 (回退到发行版默认)?" || return 0
-    apt purge -y 'linux-xanmod-*' 2>&1 | tail -5
-    rm -f /etc/apt/sources.list.d/xanmod-release.list /usr/share/keyrings/xanmod-archive-keyring.gpg
-    update-grub 2>/dev/null
-    echo -e "  ${GREEN}[OK] XanMod 已卸载，重启后回到原版内核${NC}"
-}
-
-bbr_switch_algo() {
-    bbr_detect_version
-    local opts=()
-    echo "$BBR_AVAILABLE" | grep -qw "bbr"  && opts+=("bbr (主线 BBRv1)")
-    echo "$BBR_AVAILABLE" | grep -qw "bbr2" && opts+=("bbr2")
-    echo "$BBR_AVAILABLE" | grep -qw "bbr3" && opts+=("bbr3")
-    echo "$BBR_AVAILABLE" | grep -qw "cubic" && opts+=("cubic (回退默认)")
-    opts+=("取消")
-    echo ""
-    select_menu "选择拥塞控制算法 (当前: $BBR_CURRENT)" "${opts[@]}"
-    local sel=$?
-    [ $sel -eq $(( ${#opts[@]} - 1 )) ] && return
-    local target=$(echo "${opts[$sel]}" | awk '{print $1}')
-    sysctl -w net.ipv4.tcp_congestion_control="$target" >/dev/null 2>&1
-    if [ -f "$SYSCTL_CONF" ]; then
-        sed -i "s|^net.ipv4.tcp_congestion_control = .*|net.ipv4.tcp_congestion_control = $target|" "$SYSCTL_CONF"
-    fi
-    echo -e "  ${GREEN}[OK]${NC} 已切换到 ${BOLD}${target}${NC}"
-}
-
-bbr_main() {
-    while true; do
-        bbr_status_show
-        local opts=("查看当前状态" "切换 BBR 算法 (bbr/bbr2/bbr3)")
-        if command -v apt >/dev/null 2>&1; then
-            if dpkg -l 2>/dev/null | grep -q "linux-xanmod"; then
-                opts+=("卸载 XanMod 内核")
-            else
-                opts+=("安装 XanMod 内核 (升级到 BBR3)")
-            fi
-        fi
-        opts+=("返回主菜单")
-        select_menu "BBR 内核管理" "${opts[@]}"
-        local sel=$?
-        case "${opts[$sel]}" in
-            "查看当前状态") bbr_status_show ;;
-            "切换 BBR 算法"*) bbr_switch_algo ;;
-            "安装 XanMod"*) bbr_install_xanmod ;;
-            "卸载 XanMod"*) bbr_uninstall_xanmod ;;
-            "返回主菜单") return ;;
-        esac
-        echo -ne "  ${DIM}回车继续...${NC}"; read -r
-    done
-}
-
 # ==================== 服务管理 ====================
 install_service() {
     init_config_dir
@@ -1061,7 +931,9 @@ reload_network() {
         for f in $files; do cp "$f" "$CONFIG_DIR/backup/$(echo "$f"|tr / _).bak" 2>/dev/null; rm -f "$f"; echo -e "  ${GREEN}[OK]${NC} 删除: $f"; done
     fi
     echo ""
-    [ -f "$SYSCTL_CONF" ] && run_cmd "sysctl重载" sysctl --system || echo -e "  ${DIM}无配置${NC}"
+    # 只加载我们自己的配置文件，避免刷屏所有系统/云镜像默认（仍有效，因 99-* 已是覆盖优先级）
+    [ -f "$SYSCTL_CONF" ] && run_cmd "sysctl 重载（仅本脚本配置）" sysctl -p "$SYSCTL_CONF" || echo -e "  ${DIM}无配置${NC}"
+    [ -f "$PING_CONF" ] && sysctl -p "$PING_CONF" >/dev/null 2>&1
     [ -f "$SYSCTL_CONF" ] && apply_initcwnd
     install_initcwnd_enforcer
     [ -f "$GEO_NFT" ] && run_cmd "白名单重载" nft -f "$GEO_NFT"
@@ -1327,7 +1199,8 @@ interactive_main() {
         echo -e "  ${BOLD}${WHITE}专线网络优化工具 $VERSION${NC}"
         echo -e "  ${DIM}=========================${NC}"
         echo ""
-        [ -f "$PROFILE_CONF" ] && { source "$PROFILE_CONF"; echo -e "  ${GREEN}[ON]${NC} BBR优化:  ${WHITE}$SYSCTL_PROFILE_NAME${NC}"; } || echo -e "  ${DIM}[--] BBR优化:  未配置${NC}"
+        detect_bbr_version
+        [ -f "$PROFILE_CONF" ] && { source "$PROFILE_CONF"; echo -e "  ${GREEN}[ON]${NC} BBR优化:  ${WHITE}$SYSCTL_PROFILE_NAME${NC}  ${DIM}[内核 ${BBR_VER_LABEL}]${NC}"; } || echo -e "  ${DIM}[--] BBR优化:  未配置  [内核 ${BBR_VER_LABEL}]${NC}"
         nft list table inet geo_filter >/dev/null 2>&1 && { [ -f "$GEO_CONF" ] && source "$GEO_CONF"; echo -e "  ${GREEN}[ON]${NC} 国家白名单: ${WHITE}${GEO_COUNTRIES:-启用}${NC}"; } || echo -e "  ${DIM}[--] 国家白名单: 未启用${NC}"
         local fwd_state="未启用"; iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT && fwd_state="运行中"
         [ "$fwd_state" = "运行中" ] && echo -e "  ${GREEN}[ON]${NC} 端口转发:  ${WHITE}${fwd_state}${NC}" || echo -e "  ${DIM}[--] 端口转发:  ${fwd_state}${NC}"
@@ -1340,11 +1213,9 @@ interactive_main() {
         get_meminfo
         echo -e "  ${DIM}     系统内存:  $(( MEM_TOTAL_KB/1024 ))M  Swap $(( SWAP_TOTAL_KB/1024 ))M${NC}"
         echo ""
-        bbr_detect_version
         select_menu "请选择操作" \
             "一键自动配置 (中转与落地高延迟请用手动链路)" \
             "手动链路向导" \
-            "BBR 内核管理 (当前: ${BBR_VERSION%% *})" \
             "端口转发" \
             "国家白名单" \
             "Ping 屏蔽控制 (当前: ${pcur})" \
@@ -1357,16 +1228,15 @@ interactive_main() {
         case $? in
             0)  auto_max_performance ;;
             1)  wizard_main ;;
-            2)  bbr_main; continue ;;
-            3)  port_forward_main ;;
-            4)  geo_main; continue ;;
-            5)  ping_main; continue ;;
-            6)  show_status ;;
-            7)  port_monitor; continue ;;
-            8)  reload_network ;;
-            9)  toggle_service ;;
-            10) restore_defaults ;;
-            11) rst; exit 0 ;;
+            2)  port_forward_main ;;
+            3)  geo_main; continue ;;
+            4)  ping_main; continue ;;
+            5)  show_status ;;
+            6)  port_monitor; continue ;;
+            7)  reload_network ;;
+            8)  toggle_service ;;
+            9)  restore_defaults ;;
+            10) rst; exit 0 ;;
         esac
         echo ""
         echo -ne "  ${DIM}回车返回主菜单...${NC}"; read -r
@@ -1382,9 +1252,6 @@ case "${1}" in
     ping-block) ping_apply 1 1 "禁止 v4+v6";;
     ping-allow) ping_apply 0 0 "允许 v4+v6";;
     ping-status) ping_status_show;;
-    bbr-status) bbr_status_show;;
-    bbr3-install) bbr_install_xanmod;;
-    bbr3-remove) bbr_uninstall_xanmod;;
     ports) port_all;; ports-rank) port_rank;; "") interactive_main;;
-    *) echo "$VERSION | $0 [auto|wizard|status|ports|install|restore|geo-update|geo-remove|ping-block|ping-allow|ping-status|bbr-status|bbr3-install|bbr3-remove]"; exit 1;;
+    *) echo "$VERSION | $0 [auto|wizard|status|ports|install|restore|geo-update|geo-remove|ping-block|ping-allow|ping-status]"; exit 1;;
 esac
