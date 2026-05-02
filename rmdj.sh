@@ -1,6 +1,6 @@
 #!/bin/bash
 # Remnawave Node 对接脚本 (分字段交互式版)
-# 依次输入 image / NODE_PORT / SECRET_KEY,脚本生成干净的 docker-compose.yml
+# bash <(curl -s -L https://raw.githubusercontent.com/GHUNLIL/dowunlil.github.io/main/rmdj.sh)
 # 再次运行会读取已有配置,支持修改单个字段或直接沿用
 
 set -uo pipefail
