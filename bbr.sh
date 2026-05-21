@@ -139,82 +139,16 @@ read_int() {
     done
 }
 
-# TCP 握手实测 RTT
+# 手动输入延迟 (RTT)
 read_rtt_via_tcp() {
     local label="$1" varname="$2" rtt_def="$3"; rst
     echo ""
-    echo -e "  ${DIM}-- ${label} 延迟测量 --${NC}"
-    echo -e "  ${DIM}填 ping 命令显示的 time= 数字（即 RTT）即可，无需任何换算${NC}"
-    echo -e "  ${DIM}建议端口: 22(SSH) / 80(HTTP) / 443(HTTPS) / 任何监听端口${NC}"
-    local ip port
-    while true; do
-        local hint=""
-        [ -n "$rtt_def" ] && hint=" [留空=用默认 ${rtt_def}ms]" || hint=" [留空=手动填 ping 数字]"
-        echo -ne "  ${WHITE}对端 IP${hint}: ${NC}"; read ip
-        if [ -z "$ip" ]; then
-            if [ -n "$rtt_def" ]; then
-                eval "$varname=$rtt_def"
-                echo -e "  ${YELLOW}-> 使用默认 RTT ${rtt_def}ms${NC}"
-                return
-            fi
-            local p; read_int "${label} 延迟 (ping 命令显示的数字, ms)" "" "p"
-            eval "$varname=$p"
-            echo -e "  ${DIM}-> 采用 ${p}ms 作为 RTT${NC}"
-            return
-        fi
-        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
-        echo -e "  ${RED}IP 格式错误（应为 X.X.X.X）${NC}"
-    done
-    echo -ne "  ${WHITE}端口 [默认 22]: ${NC}"; read port
-    [ -z "$port" ] && port=22
-    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { echo -e "  ${YELLOW}端口无效，改用 22${NC}"; port=22; }
-
-    _tcp_ns() {
-        local t=$(date +%s%N 2>/dev/null)
-        if [[ "$t" =~ ^[0-9]+$ ]] && [ ${#t} -ge 13 ]; then
-            echo "$t"; return
-        fi
-        t=$(python3 -c "import time;print(int(time.time()*1e9))" 2>/dev/null)
-        [ -n "$t" ] && { echo "$t"; return; }
-        t=$(perl -MTime::HiRes -e 'print int(Time::HiRes::time()*1e9)' 2>/dev/null)
-        [ -n "$t" ] && { echo "$t"; return; }
-        echo $(( $(date +%s) * 1000000000 ))
-    }
-
-    echo -ne "  ${DIM}TCP 握手探测 ${ip}:${port} (6 次取最小值)...${NC}"
-    local total=0 success=0 min_ms=99999
-    for i in 1 2 3 4 5 6; do
-        local s=$(_tcp_ns)
-        if timeout 2 bash -c "exec 9<>/dev/tcp/$ip/$port; exec 9<&-; exec 9>&-" 2>/dev/null; then
-            local e=$(_tcp_ns)
-            if [ "$s" != "0" ] && [ "$e" != "0" ] && [ "$e" -gt "$s" ]; then
-                local ms=$(( (e - s) / 1000000 ))
-                [ $ms -lt 1 ] && ms=1
-                [ $ms -lt $min_ms ] && min_ms=$ms
-                total=$(( total + ms ))
-                success=$(( success + 1 ))
-            fi
-        fi
-        sleep 0.2 2>/dev/null
-    done
-
-    if [ $success -eq 0 ]; then
-        echo -e "\r  ${RED}[X] TCP 探测失败${NC} ${DIM}(${ip}:${port} 不可达，端口过滤?)${NC}     "
-        if [ -n "$rtt_def" ]; then
-            echo -e "  ${YELLOW}-> 回退默认 RTT ${rtt_def}ms${NC}"
-            eval "$varname=$rtt_def"
-        else
-            local p; read_int "${label} 延迟 (ping 命令显示的数字, ms)" "" "p"
-            eval "$varname=$p"
-        fi
-        return
-    fi
-
-    local avg=$(( total / success ))
-    echo -e "\r  ${GREEN}[OK]${NC} ${ip}:${port}                                                         "
-    echo -e "       延迟: 平均 ${avg}ms / ${BOLD}最小 ${min_ms}ms${NC} (与 ping 命令显示的数字同义)"
-    echo -e "       ${DIM}-> 采用 ${min_ms}ms 作为 RTT (BBR 友好，去抖动)${NC}"
-    eval "$varname=$min_ms"
+    echo -e "  ${DIM}-- ${label} 延迟 --${NC}"
+    echo -e "  ${DIM}填 ping 命令显示的 time= 数字（即 RTT，单位 ms），无需任何换算${NC}"
+    local p
+    read_int "${label} 延迟 (ping 命令显示的数字, ms)" "$rtt_def" "p"
+    eval "$varname=$p"
+    echo -e "  ${DIM}-> 采用 ${p}ms 作为 RTT${NC}"
 }
 
 # ==================== 多线路收集器 ====================
