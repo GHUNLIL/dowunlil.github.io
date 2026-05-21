@@ -10,6 +10,7 @@ UPDATE_URL="https://raw.githubusercontent.com/GHUNLIL/dowunlil.github.io/main/bb
 CONFIG_DIR="/etc/network-optimizer"
 SYSCTL_CONF="$CONFIG_DIR/sysctl-optimize.conf"
 PROFILE_CONF="$CONFIG_DIR/profile.conf"
+# GEO_* 仅保留给 restore 清理旧版国家白名单残留（白名单功能已移除）
 GEO_CONF="$CONFIG_DIR/geo-whitelist.conf"
 GEO_DIR="$CONFIG_DIR/geo-zones"
 GEO_NFT="$CONFIG_DIR/geo-nftables.nft"
@@ -17,14 +18,6 @@ PF_NFT="$CONFIG_DIR/port-forward.nft"
 PF_TABLE="port_forward"
 GAME_NET_SCRIPT="/usr/local/sbin/gaming-net-apply.sh"
 GAME_NET_SERVICE="/etc/systemd/system/gaming-net-apply.service"
-GEO_IP_SOURCE="https://www.ipdeny.com/ipblocks/data/aggregated"
-
-declare -A COUNTRY_NAMES=(
-    [cn]="中国" [hk]="香港" [tw]="台湾" [jp]="日本" [kr]="韩国"
-    [sg]="新加坡" [us]="美国" [gb]="英国" [de]="德国" [fr]="法国"
-    [au]="澳大利亚" [ca]="加拿大" [ru]="俄罗斯" [th]="泰国" [my]="马来西亚"
-    [vn]="越南" [id]="印尼" [ph]="菲律宾" [in]="印度" [nl]="荷兰"
-)
 
 [ "$(id -u)" -ne 0 ] && { echo "错误: 需要root权限"; exit 1; }
 trap 'tput cnorm 2>/dev/null; stty sane 2>/dev/null; echo; exit 0' INT TERM
@@ -37,6 +30,8 @@ rst() { tput cnorm 2>/dev/null; stty sane 2>/dev/null; }
 
 self_update_once() {
     [ "${BBR_SELF_UPDATED:-0}" = "1" ] && return 0
+    # 开机/服务等非交互入口不自更新，避免启动期联网失败或拉到坏脚本把开机服务跑挂
+    case "${1:-}" in start|service-start|stop|service-stop|status) return 0;; esac
     command -v wget >/dev/null 2>&1 || return 0
 
     local self tmp
@@ -45,14 +40,17 @@ self_update_once() {
     tmp="${self}.update.$$"
 
     echo -ne "  ${DIM}检查最新脚本版本(5秒超时)...${NC}"
-    if timeout 5 wget -q -O "$tmp" "$UPDATE_URL" 2>/dev/null && [ -s "$tmp" ]; then
+    # 校验: 非空 + shebang + 含关键函数 + 语法通过，否则视为下载损坏，绝不覆盖本地脚本
+    if timeout 5 wget -q -O "$tmp" "$UPDATE_URL" 2>/dev/null && [ -s "$tmp" ] \
+        && head -1 "$tmp" | grep -q '^#!' && grep -q 'self_update_once' "$tmp" \
+        && bash -n "$tmp" 2>/dev/null; then
         chmod +x "$tmp" 2>/dev/null || true
         mv -f "$tmp" "$self"
         echo -e "\r  ${GREEN}[OK]${NC} 已拉取最新脚本，继续执行...       "
         exec env BBR_SELF_UPDATED=1 bash "$self" "$@"
     else
         rm -f "$tmp" 2>/dev/null || true
-        echo -e "\r  ${YELLOW}[!]${NC} 5秒内未拉取到最新版本，运行本地脚本。"
+        echo -e "\r  ${YELLOW}[!]${NC} 未拉取到有效的最新版本，运行本地脚本。"
     fi
 }
 
@@ -227,8 +225,13 @@ calculate_and_generate() {
     [ $udpr_b -gt $udpr ] && udpr=$udpr_b
     udpr=$(clamp $udpr 2097152 16777216)
 
-    local udp_max_pages=$(( MEM_AVAIL_KB * 1024 / 4096 * 40 / 100 ))
-    [ $udp_max_pages -lt 524288 ] && udp_max_pages=524288
+    # udp_mem 单位是“页”(4KB)。取可用内存的 40%，并夹在 [64MB, 物理内存的 50%]：
+    # 旧版固定 2GB 死下限在小内存机上会高于物理内存，使 UDP 内存压力永不触发 -> OOM 风险
+    local udp_max_pages=$(( MEM_AVAIL_KB / 4 * 40 / 100 ))
+    local udp_floor=16384
+    local udp_cap=$(( MEM_TOTAL_KB / 8 ))
+    [ $udp_max_pages -lt $udp_floor ] && udp_max_pages=$udp_floor
+    [ $udp_max_pages -gt $udp_cap ] && udp_max_pages=$udp_cap
     local udpml=$(( udp_max_pages / 2 ))
     local udpmm=$(( udp_max_pages * 3 / 4 ))
     local udpmax=$udp_max_pages
@@ -938,9 +941,6 @@ if [ -n "\$IFACE" ] && [ -d "/sys/class/net/\$IFACE" ]; then
     ip link set dev "\$IFACE" txqueuelen "\$TXQLEN" >/dev/null 2>&1 || true
     tc qdisc replace dev "\$IFACE" root fq >/dev/null 2>&1 || true
     sysctl -w "net.ipv6.conf.\$IFACE.accept_ra=2" >/dev/null 2>&1 || true
-    if command -v ethtool >/dev/null 2>&1; then
-        ethtool -K "\$IFACE" gro off gso off tso off >/dev/null 2>&1 || true
-    fi
 fi
 EOF
     chmod +x "$GAME_NET_SCRIPT"
@@ -962,7 +962,7 @@ EOF
 
     systemctl daemon-reload >/dev/null 2>&1
     if systemctl enable --now gaming-net-apply.service >/dev/null 2>&1; then
-        echo -e "  ${GREEN}[OK]${NC} 已应用 ${role_label} 运行时增强: txqueuelen=${txq}, fq, IPv6 RA保护, offload关闭"
+        echo -e "  ${GREEN}[OK]${NC} 已应用 ${role_label} 运行时增强: txqueuelen=${txq}, fq qdisc, IPv6 RA保护 (保留网卡 offload)"
     else
         echo -e "  ${YELLOW}[!]${NC} gaming-net-apply.service 启用失败，可手动执行: ${GAME_NET_SCRIPT}"
     fi
@@ -1261,12 +1261,6 @@ show_status() {
     echo -e "  游戏UDP增强: ${BOLD}${game_net}${NC}"
     local fwd_status; fwd_status=$(pf_status_state)
     echo -e "  转发: ${BOLD}${fwd_status}${NC} | Ping: ${BOLD}$(ping_status_str)${NC}"
-    echo ""
-    if nft list table inet geo_filter >/dev/null 2>&1; then
-        [ -f "$GEO_CONF" ] && source "$GEO_CONF"
-        echo -e "  ${GREEN}[ON]${NC} 白名单: ${WHITE}${GEO_COUNTRIES:-启用}${NC}"
-        echo -e "  拦截: ${BOLD}$(nft list chain inet geo_filter input 2>/dev/null|grep -oP 'counter packets \K[0-9]+'|tail -1||echo 0)${NC} 包"
-    else echo -e "  ${DIM}[--] 白名单: 未启用${NC}"; fi
     echo ""; nstat -sz TcpRetransSegs 2>/dev/null | sed 's/^/  /' || true; echo ""
 }
 
@@ -1339,7 +1333,6 @@ service_start() {
     [ -f "$SYSCTL_CONF" ] && sysctl --system >/dev/null 2>&1
     [ -f "$SYSCTL_CONF" ] && apply_initcwnd >/dev/null 2>&1
     install_initcwnd_enforcer >/dev/null 2>&1
-    [ -f "$GEO_NFT" ] && nft -f "$GEO_NFT" 2>/dev/null
     [ -f "$PF_NFT" ] && pf_reload_rules >/dev/null 2>&1
 }
 service_stop() { :; }
@@ -1363,7 +1356,6 @@ reload_network() {
     [ -f "$SYSCTL_CONF" ] && apply_initcwnd
     install_initcwnd_enforcer
     systemctl is-enabled gaming-net-apply.service >/dev/null 2>&1 && run_cmd "游戏UDP运行时增强" systemctl restart gaming-net-apply.service
-    [ -f "$GEO_NFT" ] && run_cmd "白名单重载" nft -f "$GEO_NFT"
     [ -f "$PF_NFT" ] && run_cmd "端口转发重载" pf_reload_rules
     echo -e "  ${GREEN}${BOLD}完成${NC} | $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) rmem$(( $(sysctl -n net.core.rmem_max 2>/dev/null) / 1048576 ))MB"; echo ""
 }
@@ -1381,136 +1373,6 @@ restore_defaults() {
     rm -f "$SYSCTL_CONF" "$PROFILE_CONF" "$GEO_CONF" "$GEO_NFT" "$PF_NFT"; rm -rf "$GEO_DIR"
     echo -e "  ${GREEN}已恢复${NC}"
 }
-
-# ==================== 国家白名单 ====================
-geo_main() {
-    while true; do
-        echo ""
-        echo -e "  ${BOLD}${CYAN}国家 IP 白名单${NC}"
-        if nft list table inet geo_filter >/dev/null 2>&1; then
-            [ -f "$GEO_CONF" ] && source "$GEO_CONF"
-            echo -e "  ${GREEN}[ON]${NC} 白名单: ${WHITE}${GEO_COUNTRIES:-启用}${NC}"
-        else
-            echo -e "  ${DIM}[--] 白名单: 未启用${NC}"
-        fi
-        echo ""
-        local pl="切换为禁止 Ping"
-        [ -f "$GEO_CONF" ] && source "$GEO_CONF" && [ "${GEO_ALLOW_PING:-yes}" = "no" ] && pl="切换为允许 Ping"
-        select_menu "请选择" \
-            "查看当前状态" \
-            "新建 / 修改白名单" \
-            "更新 IP 库" \
-            "$pl" \
-            "关闭白名单" \
-            "返回主菜单"
-        case $? in
-            0) geo_status;;
-            1) geo_setup;;
-            2) geo_update;;
-            3) geo_toggle_ping;;
-            4) geo_remove;;
-            5) return;;
-        esac
-        echo -ne "  ${DIM}回车继续...${NC}"; read -r
-    done
-}
-
-geo_setup() {
-    echo ""
-    command -v nft >/dev/null || { echo -e "  ${RED}需 nftables${NC}"; return; }
-    command -v curl >/dev/null || { echo -e "  ${RED}需 curl${NC}"; return; }
-    echo -e "  ${RED}${BOLD}[!] 确保SSH端口正确${NC}"; echo ""
-    local sp; read_int "SSH端口" "22" "sp"
-    echo ""; select_menu "流量方向" "只控制入站" "入站+转发"; local cm="input"; [ $? -eq 1 ] && cm="input+forward"
-    echo ""; select_menu "Ping" "允许" "禁止"; local ap="yes"; [ $? -eq 1 ] && ap="no"
-    echo ""; echo -e "  ${DIM}cn hk jp kr sg us de gb fr au ca ru th my vn id ph in nl${NC}"; rst
-    local cc=""
-    while [ -z "$cc" ]; do echo -ne "  ${WHITE}国家代码: ${NC}"; read cc; cc=$(echo "$cc"|tr '[:upper:]' '[:lower:]'|tr ',' ' '|xargs)
-        for c in $cc; do [[ "$c" =~ ^[a-z]{2}$ ]] || { echo -e "  ${RED}无效: $c${NC}"; cc=""; break; }; done
-    done
-    echo ""; rst; echo -ne "  ${WHITE}额外IP (可选): ${NC}"; read ci
-    [ -n "$ci" ] && { local x=""; for i in $ci; do [[ "$i" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$ ]] && x="$x $i"; done; ci=$(echo "$x"|xargs); }
-    echo ""; confirm_action "确认? SSH=$sp 国家=$cc" || return
-    init_config_dir; mkdir -p "$GEO_DIR"
-    echo "GEO_COUNTRIES=\"$cc\"
-GEO_SSH_PORT=\"$sp\"
-GEO_CUSTOM_IPS=\"$ci\"
-GEO_CHAIN_MODE=\"$cm\"
-GEO_ALLOW_PING=\"$ap\"" > "$GEO_CONF"
-    geo_load_and_apply "$cc" "$sp" "$ci" "$cm" "$ap" "no"
-}
-
-geo_load_and_apply() {
-    local countries="$1" sp="$2" ci="$3" cm="${4:-input}" ap="${5:-yes}" force="${6:-no}"
-    echo ""; mkdir -p "$GEO_DIR"; local ips="" fails=0
-    for cc in $countries; do
-        local zf="$GEO_DIR/${cc}.zone" nm="${COUNTRY_NAMES[$cc]:-$cc}"
-        if [ "$force" = "no" ] && [ -s "$zf" ]; then echo -e "  $cc($nm) ${GREEN}缓存${NC}"
-        else echo -ne "  $cc($nm)..."; curl -sf --connect-timeout 10 --max-time 60 "${GEO_IP_SOURCE}/${cc}-aggregated.zone" -o "$zf" 2>/dev/null \
-            && echo -e "${GREEN}[OK]${NC}" || { echo -e "${RED}[X]${NC}"; ((fails++)); }; fi
-        [ -f "$zf" ] && while IFS= read -r l; do [[ "$l" =~ ^#|^$ ]] || ips="${ips}${l},"; done < "$zf"
-    done
-    ips="${ips%,}"; [ -z "$ips" ] && { echo -e "  ${RED}无数据${NC}"; return 1; }
-    local cir="" cfr=""
-    [ -n "$ci" ] && for ip in $ci; do cir="$cir
-        ip saddr $ip accept"; cfr="$cfr
-        ip saddr $ip accept"; done
-    local icmp; [ "$ap" = "yes" ] && icmp="ip protocol icmp accept" || icmp="ip protocol icmp drop"
-    local fwd=""; [ "$cm" = "input+forward" ] && fwd="
-    chain forward {
-        type filter hook forward priority 10; policy accept;
-        ct state established,related accept
-        ip saddr {10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10} accept
-        ip saddr @wl accept${cfr}
-        counter drop
-    }"
-    cat > "$GEO_NFT" << NFTEOF
-#!/usr/sbin/nft -f
-table inet geo_filter
-delete table inet geo_filter
-table inet geo_filter {
-    set wl { type ipv4_addr; flags interval; auto-merge; elements = { ${ips} } }
-    chain input {
-        type filter hook input priority 10; policy accept;
-        ct state established,related accept
-        iif "lo" accept
-        ip saddr {10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,127.0.0.0/8} accept
-        tcp dport ${sp} accept
-        ${icmp}
-        ip saddr @wl accept${cir}
-        counter drop
-    }${fwd}
-}
-NFTEOF
-    run_cmd "应用规则" nft -f "$GEO_NFT" || return 1
-    cat > /etc/systemd/system/geo-whitelist.service << EOF
-[Unit]
-Description=GeoIP Whitelist
-After=network-online.target
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/sbin/nft -f ${GEO_NFT}
-ExecStop=/usr/sbin/nft delete table inet geo_filter
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload; systemctl enable geo-whitelist.service 2>/dev/null
-    sed -i '/^GEO_LAST_UPDATE=/d' "$GEO_CONF" 2>/dev/null
-    echo "GEO_LAST_UPDATE=\"$(date '+%Y-%m-%d %H:%M:%S')\"" >> "$GEO_CONF"
-    echo -e "  ${GREEN}${BOLD}白名单生效: $countries | SSH $sp${NC}"; echo ""
-}
-
-geo_update() { [ -f "$GEO_CONF" ] || { echo -e "  ${RED}请先设置${NC}"; return; }; source "$GEO_CONF"; geo_load_and_apply "$GEO_COUNTRIES" "$GEO_SSH_PORT" "$GEO_CUSTOM_IPS" "${GEO_CHAIN_MODE:-input}" "${GEO_ALLOW_PING:-yes}" "yes"; }
-geo_toggle_ping() { [ -f "$GEO_CONF" ] || { echo -e "  ${RED}请先设置${NC}"; return; }; source "$GEO_CONF"; local np; [ "${GEO_ALLOW_PING:-yes}" = "yes" ] && np="no" || np="yes"; sed -i "s/^GEO_ALLOW_PING=.*/GEO_ALLOW_PING=\"$np\"/" "$GEO_CONF"; source "$GEO_CONF"; geo_load_and_apply "$GEO_COUNTRIES" "$GEO_SSH_PORT" "$GEO_CUSTOM_IPS" "${GEO_CHAIN_MODE:-input}" "$np" "no"; }
-geo_status() {
-    echo ""; echo -e "  ${BOLD}${CYAN}[ 白名单 ]${NC}"
-    if nft list table inet geo_filter >/dev/null 2>&1; then
-        echo -e "  ${GREEN}[ON]${NC} 启用"; [ -f "$GEO_CONF" ] && { source "$GEO_CONF"; echo -e "  $GEO_COUNTRIES | SSH:$GEO_SSH_PORT | Ping:${GEO_ALLOW_PING:-yes}"; [ -n "${GEO_LAST_UPDATE:-}" ] && echo -e "  更新: $GEO_LAST_UPDATE"; }
-        echo ""; nft list chain inet geo_filter input 2>/dev/null | grep -E "accept|drop" | head -5 | sed 's/^/  /'
-    else echo -e "  ${DIM}未启用${NC}"; fi; echo ""
-}
-geo_remove() { nft list table inet geo_filter >/dev/null 2>&1 || { echo -e "  ${DIM}未启用${NC}"; return; }; confirm_action "关闭白名单?" && { nft delete table inet geo_filter 2>/dev/null; systemctl disable geo-whitelist.service 2>/dev/null; rm -f /etc/systemd/system/geo-whitelist.service; systemctl daemon-reload 2>/dev/null; echo -e "  ${GREEN}已关闭${NC}"; }; }
 
 # ==================== Ping 控制 (独立) ====================
 PING_CONF="/etc/sysctl.d/97-icmp-control.conf"
@@ -1539,7 +1401,6 @@ ping_main() {
     while true; do
         echo ""
         echo -e "  ${BOLD}${CYAN}Ping (ICMP) 屏蔽控制${NC}"
-        echo -e "  ${DIM}独立功能，不依赖国家白名单${NC}"
         local cur=$(ping_status_str)
         case "$cur" in
             "全禁") echo -e "  ${RED}[ON]${NC} 当前: 全屏蔽 (v4+v6 都不响应)";;
@@ -1575,10 +1436,6 @@ ping_status_show() {
     echo -e "  IPv4 ICMP echo: ${BOLD}$([ "$v4" = "1" ] && echo "禁止" || echo "允许")${NC} (=$v4)"
     echo -e "  IPv6 ICMP echo: ${BOLD}$([ "$v6" = "1" ] && echo "禁止" || echo "允许")${NC} (=$v6)"
     [ -f "$PING_CONF" ] && echo -e "  持久化文件: ${DIM}$PING_CONF${NC}" || echo -e "  ${DIM}无持久化文件 (当前为系统/其他配置默认值)${NC}"
-    if nft list table inet geo_filter >/dev/null 2>&1 && [ -f "$GEO_CONF" ]; then
-        source "$GEO_CONF"
-        echo -e "  ${DIM}白名单内 ping 策略: ${GEO_ALLOW_PING:-yes} (与本独立控制叠加，最严格者生效)${NC}"
-    fi
     echo ""
 }
 
@@ -1629,7 +1486,6 @@ interactive_main() {
         echo ""
         detect_bbr_version
         [ -f "$PROFILE_CONF" ] && { source "$PROFILE_CONF"; echo -e "  ${GREEN}[ON]${NC} BBR优化:  ${WHITE}$SYSCTL_PROFILE_NAME${NC}  ${DIM}[内核 ${BBR_VER_LABEL}]${NC}"; } || echo -e "  ${DIM}[--] BBR优化:  未配置  [内核 ${BBR_VER_LABEL}]${NC}"
-        nft list table inet geo_filter >/dev/null 2>&1 && { [ -f "$GEO_CONF" ] && source "$GEO_CONF"; echo -e "  ${GREEN}[ON]${NC} 国家白名单: ${WHITE}${GEO_COUNTRIES:-启用}${NC}"; } || echo -e "  ${DIM}[--] 国家白名单: 未启用${NC}"
         local fwd_state; fwd_state=$(pf_status_state)
         [ "$fwd_state" = "运行中" ] && echo -e "  ${GREEN}[ON]${NC} 端口转发:  ${WHITE}${fwd_state}${NC}" || echo -e "  ${DIM}[--] 端口转发:  ${fwd_state}${NC}"
         local pcur=$(ping_status_str)
@@ -1645,7 +1501,6 @@ interactive_main() {
             "一键自动配置 (中转与落地高延迟请用手动链路)" \
             "手动链路向导" \
             "端口转发" \
-            "国家白名单" \
             "Ping 屏蔽控制 (当前: ${pcur})" \
             "查看系统状态" \
             "查看端口连接" \
@@ -1657,14 +1512,13 @@ interactive_main() {
             0)  auto_max_performance ;;
             1)  wizard_main ;;
             2)  port_forward_main ;;
-            3)  geo_main; continue ;;
-            4)  ping_main; continue ;;
-            5)  show_status ;;
-            6)  port_monitor; continue ;;
-            7)  reload_network ;;
-            8)  toggle_service ;;
-            9)  restore_defaults ;;
-            10) rst; exit 0 ;;
+            3)  ping_main; continue ;;
+            4)  show_status ;;
+            5)  port_monitor; continue ;;
+            6)  reload_network ;;
+            7)  toggle_service ;;
+            8)  restore_defaults ;;
+            9)  rst; exit 0 ;;
         esac
         echo ""
         echo -ne "  ${DIM}回车返回主菜单...${NC}"; read -r
@@ -1676,10 +1530,9 @@ case "${1}" in
     start|service-start) service_start;; stop|service-stop) service_stop;; status) show_status;;
     auto) auto_max_performance;;
     install) install_service;; restore) restore_defaults;; wizard) wizard_main;;
-    geo-update) geo_update;; geo-remove) geo_remove;; geo-status) geo_status;;
     ping-block) ping_apply 1 1 "禁止 v4+v6";;
     ping-allow) ping_apply 0 0 "允许 v4+v6";;
     ping-status) ping_status_show;;
     ports) port_all;; ports-rank) port_rank;; "") interactive_main;;
-    *) echo "$VERSION | $0 [auto|wizard|status|ports|install|restore|geo-update|geo-remove|ping-block|ping-allow|ping-status]"; exit 1;;
+    *) echo "$VERSION | $0 [auto|wizard|status|ports|install|restore|ping-block|ping-allow|ping-status]"; exit 1;;
 esac
