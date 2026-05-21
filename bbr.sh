@@ -5,17 +5,11 @@
 # 用法: sudo bash bbr.sh [命令]
 # ============================================================
 
-VERSION="v1.3"
+VERSION="v1.4"
 UPDATE_URL="https://raw.githubusercontent.com/GHUNLIL/dowunlil.github.io/main/bbr.sh"
 CONFIG_DIR="/etc/network-optimizer"
 SYSCTL_CONF="$CONFIG_DIR/sysctl-optimize.conf"
 PROFILE_CONF="$CONFIG_DIR/profile.conf"
-# 以下变量仅保留给 restore 清理旧版残留（国家白名单 / 端口转发功能均已移除）
-GEO_CONF="$CONFIG_DIR/geo-whitelist.conf"
-GEO_DIR="$CONFIG_DIR/geo-zones"
-GEO_NFT="$CONFIG_DIR/geo-nftables.nft"
-PF_NFT="$CONFIG_DIR/port-forward.nft"
-PF_TABLE="port_forward"
 GAME_NET_SCRIPT="/usr/local/sbin/gaming-net-apply.sh"
 GAME_NET_SERVICE="/etc/systemd/system/gaming-net-apply.service"
 
@@ -806,7 +800,6 @@ show_status() {
     echo -e "  守护: ${BOLD}${enf}${NC}"
     local game_net=$(systemctl is-active gaming-net-apply.service 2>/dev/null || echo "inactive")
     echo -e "  游戏UDP增强: ${BOLD}${game_net}${NC}"
-    echo -e "  Ping: ${BOLD}$(ping_status_str)${NC}"
     echo ""; nstat -sz TcpRetransSegs 2>/dev/null | sed 's/^/  /' || true; echo ""
 }
 
@@ -849,39 +842,6 @@ EOF
     echo -e "  ${GREEN}[OK]${NC} initcwnd 守护已启动（每分钟检查，网络断开后自动恢复秒开）"
 }
 
-# ==================== 服务管理 ====================
-install_service() {
-    init_config_dir
-    cat > /etc/systemd/system/network-optimizer.service << EOF
-[Unit]
-Description=专线网络优化
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=$(readlink -f "$0") service-start
-ExecStop=$(readlink -f "$0") service-stop
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload; systemctl enable network-optimizer.service
-    echo -e "  ${GREEN}[OK] 自启已安装${NC}"
-}
-
-toggle_service() {
-    systemctl is-enabled network-optimizer.service >/dev/null 2>&1 \
-        && { confirm_action "关闭自启?" && systemctl disable network-optimizer.service 2>/dev/null && echo -e "  ${GREEN}已关闭${NC}"; } \
-        || install_service
-}
-
-service_start() {
-    [ -f "$SYSCTL_CONF" ] && sysctl --system >/dev/null 2>&1
-    [ -f "$SYSCTL_CONF" ] && apply_initcwnd >/dev/null 2>&1
-    install_initcwnd_enforcer >/dev/null 2>&1
-}
-service_stop() { :; }
-
 reload_network() {
     echo ""; echo -e "  ${BOLD}${CYAN}刷新网络配置${NC}"; echo ""
     local MATCH='tcp_congestion_control|tcp_rmem|tcp_wmem|rmem_max|wmem_max|default_qdisc|tcp_notsent_lowat|busy_poll|busy_read|optmem_max|tcp_fastopen|tcp_tw_reuse|ip_forward|udp_rmem_min|udp_wmem_min|udp_mem|nf_conntrack_max'
@@ -897,90 +857,10 @@ reload_network() {
     echo ""
     # 只加载我们自己的配置文件，避免刷屏所有系统/云镜像默认（仍有效，因 99-* 已是覆盖优先级）
     [ -f "$SYSCTL_CONF" ] && run_cmd "sysctl 重载（仅本脚本配置）" sysctl -p "$SYSCTL_CONF" || echo -e "  ${DIM}无配置${NC}"
-    [ -f "$PING_CONF" ] && sysctl -p "$PING_CONF" >/dev/null 2>&1
     [ -f "$SYSCTL_CONF" ] && apply_initcwnd
     install_initcwnd_enforcer
     systemctl is-enabled gaming-net-apply.service >/dev/null 2>&1 && run_cmd "游戏UDP运行时增强" systemctl restart gaming-net-apply.service
     echo -e "  ${GREEN}${BOLD}完成${NC} | $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) rmem$(( $(sysctl -n net.core.rmem_max 2>/dev/null) / 1048576 ))MB"; echo ""
-}
-
-restore_defaults() {
-    echo ""; confirm_action "恢复默认? (删除所有优化)" || return
-    rm -f /etc/sysctl.d/99-network-optimize.conf "$PING_CONF"; sysctl --system >/dev/null 2>&1
-    rm -f /etc/security/limits.d/99-network-optimize.conf
-    systemctl disable --now initcwnd-enforcer.timer >/dev/null 2>&1
-    rm -f /etc/systemd/system/initcwnd-enforcer.* /usr/local/bin/enforce-initcwnd.sh
-    for s in network-optimizer geo-whitelist rps-optimize gaming-net-apply; do systemctl disable ${s}.service 2>/dev/null; rm -f /etc/systemd/system/${s}.service; done
-    systemctl daemon-reload 2>/dev/null; nft delete table inet geo_filter 2>/dev/null; nft delete table ip "$PF_TABLE" 2>/dev/null; nft delete table ip6 "$PF_TABLE" 2>/dev/null
-    rm -f /usr/local/bin/enforce-rps.sh "$GAME_NET_SCRIPT"
-    [ -f "$CONFIG_DIR/sysctl-backup.conf" ] && echo -e "  ${DIM}备份保留: $CONFIG_DIR/sysctl-backup.conf${NC}"
-    rm -f "$SYSCTL_CONF" "$PROFILE_CONF" "$GEO_CONF" "$GEO_NFT" "$PF_NFT"; rm -rf "$GEO_DIR"
-    echo -e "  ${GREEN}已恢复${NC}"
-}
-
-# ==================== Ping 控制 (独立) ====================
-PING_CONF="/etc/sysctl.d/97-icmp-control.conf"
-
-ping_status_str() {
-    local v4=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)
-    local v6=$(sysctl -n net.ipv6.icmp.echo_ignore_all 2>/dev/null)
-    [ "$v4" = "1" ] && [ "$v6" = "1" ] && { echo "全禁"; return; }
-    [ "$v4" = "1" ] && [ "$v6" != "1" ] && { echo "禁v4"; return; }
-    [ "$v4" != "1" ] && [ "$v6" = "1" ] && { echo "禁v6"; return; }
-    echo "全允许"
-}
-
-ping_apply() {
-    local v4="$1" v6="$2" label="$3"
-    cat > "$PING_CONF" << EOF
-# ICMP echo control - 由 bbr.sh 管理 ($label)
-net.ipv4.icmp_echo_ignore_all = $v4
-net.ipv6.icmp.echo_ignore_all = $v6
-EOF
-    sysctl -p "$PING_CONF" >/dev/null 2>&1
-    echo -e "  ${GREEN}[OK]${NC} 已设置: ${BOLD}${label}${NC} (持久化到 $PING_CONF)"
-}
-
-ping_main() {
-    while true; do
-        echo ""
-        echo -e "  ${BOLD}${CYAN}Ping (ICMP) 屏蔽控制${NC}"
-        local cur=$(ping_status_str)
-        case "$cur" in
-            "全禁") echo -e "  ${RED}[ON]${NC} 当前: 全屏蔽 (v4+v6 都不响应)";;
-            "禁v4") echo -e "  ${YELLOW}[ON]${NC} 当前: 仅屏蔽 IPv4";;
-            "禁v6") echo -e "  ${YELLOW}[ON]${NC} 当前: 仅屏蔽 IPv6";;
-            *)      echo -e "  ${GREEN}[--]${NC} 当前: 全允许";;
-        esac
-        echo ""
-        select_menu "请选择" \
-            "查看详细状态" \
-            "全屏蔽 (v4 + v6)" \
-            "全允许 (v4 + v6)" \
-            "仅屏蔽 IPv4 (允许 v6)" \
-            "仅屏蔽 IPv6 (允许 v4)" \
-            "返回主菜单"
-        case $? in
-            0) ping_status_show;;
-            1) ping_apply 1 1 "全屏蔽 v4+v6";;
-            2) ping_apply 0 0 "全允许 v4+v6";;
-            3) ping_apply 1 0 "屏蔽 v4 / 允许 v6";;
-            4) ping_apply 0 1 "允许 v4 / 屏蔽 v6";;
-            5) return;;
-        esac
-        echo -ne "  ${DIM}回车继续...${NC}"; read -r
-    done
-}
-
-ping_status_show() {
-    echo ""
-    echo -e "  ${BOLD}${CYAN}[ Ping 当前状态 ]${NC}"
-    local v4=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)
-    local v6=$(sysctl -n net.ipv6.icmp.echo_ignore_all 2>/dev/null)
-    echo -e "  IPv4 ICMP echo: ${BOLD}$([ "$v4" = "1" ] && echo "禁止" || echo "允许")${NC} (=$v4)"
-    echo -e "  IPv6 ICMP echo: ${BOLD}$([ "$v6" = "1" ] && echo "禁止" || echo "允许")${NC} (=$v6)"
-    [ -f "$PING_CONF" ] && echo -e "  持久化文件: ${DIM}$PING_CONF${NC}" || echo -e "  ${DIM}无持久化文件 (当前为系统/其他配置默认值)${NC}"
-    echo ""
 }
 
 # ==================== 端口监控 ====================
@@ -1030,35 +910,23 @@ interactive_main() {
         echo ""
         detect_bbr_version
         [ -f "$PROFILE_CONF" ] && { source "$PROFILE_CONF"; echo -e "  ${GREEN}[ON]${NC} BBR优化:  ${WHITE}$SYSCTL_PROFILE_NAME${NC}  ${DIM}[内核 ${BBR_VER_LABEL}]${NC}"; } || echo -e "  ${DIM}[--] BBR优化:  未配置  [内核 ${BBR_VER_LABEL}]${NC}"
-        local pcur=$(ping_status_str)
-        case "$pcur" in
-            "全允许") echo -e "  ${DIM}[--] Ping屏蔽:  全允许${NC}";;
-            *)       echo -e "  ${GREEN}[ON]${NC} Ping屏蔽:  ${WHITE}${pcur}${NC}";;
-        esac
-        local al="安装开机自启"; systemctl is-enabled network-optimizer.service >/dev/null 2>&1 && { echo -e "  ${GREEN}[ON]${NC} 开机自启:  启用"; al="关闭开机自启"; } || echo -e "  ${DIM}[--] 开机自启:  未启用${NC}"
         get_meminfo
         echo -e "  ${DIM}     系统内存:  $(( MEM_TOTAL_KB/1024 ))M  Swap $(( SWAP_TOTAL_KB/1024 ))M${NC}"
         echo ""
         select_menu "请选择操作" \
-            "一键自动配置 (中转与落地高延迟请用手动链路)" \
             "手动链路向导" \
-            "Ping 屏蔽控制 (当前: ${pcur})" \
+            "一键自动配置 (中转与落地高延迟请用手动链路)" \
             "查看系统状态" \
             "查看端口连接" \
             "刷新当前配置" \
-            "$al" \
-            "恢复系统默认" \
             "退出"
         case $? in
-            0)  auto_max_performance ;;
-            1)  wizard_main ;;
-            2)  ping_main; continue ;;
-            3)  show_status ;;
-            4)  port_monitor; continue ;;
-            5)  reload_network ;;
-            6)  toggle_service ;;
-            7)  restore_defaults ;;
-            8)  rst; exit 0 ;;
+            0)  wizard_main ;;
+            1)  auto_max_performance ;;
+            2)  show_status ;;
+            3)  port_monitor; continue ;;
+            4)  reload_network ;;
+            5)  rst; exit 0 ;;
         esac
         echo ""
         echo -ne "  ${DIM}回车返回主菜单...${NC}"; read -r
@@ -1067,12 +935,9 @@ interactive_main() {
 
 # ==================== 入口 ====================
 case "${1}" in
-    start|service-start) service_start;; stop|service-stop) service_stop;; status) show_status;;
+    status) show_status;;
     auto) auto_max_performance;;
-    install) install_service;; restore) restore_defaults;; wizard) wizard_main;;
-    ping-block) ping_apply 1 1 "禁止 v4+v6";;
-    ping-allow) ping_apply 0 0 "允许 v4+v6";;
-    ping-status) ping_status_show;;
+    wizard) wizard_main;;
     ports) port_all;; ports-rank) port_rank;; "") interactive_main;;
-    *) echo "$VERSION | $0 [auto|wizard|status|ports|install|restore|ping-block|ping-allow|ping-status]"; exit 1;;
+    *) echo "$VERSION | $0 [auto|wizard|status|ports]"; exit 1;;
 esac
