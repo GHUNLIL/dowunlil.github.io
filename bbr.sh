@@ -10,7 +10,7 @@ UPDATE_URL="https://raw.githubusercontent.com/GHUNLIL/dowunlil.github.io/main/bb
 CONFIG_DIR="/etc/network-optimizer"
 SYSCTL_CONF="$CONFIG_DIR/sysctl-optimize.conf"
 PROFILE_CONF="$CONFIG_DIR/profile.conf"
-# GEO_* 仅保留给 restore 清理旧版国家白名单残留（白名单功能已移除）
+# 以下变量仅保留给 restore 清理旧版残留（国家白名单 / 端口转发功能均已移除）
 GEO_CONF="$CONFIG_DIR/geo-whitelist.conf"
 GEO_DIR="$CONFIG_DIR/geo-zones"
 GEO_NFT="$CONFIG_DIR/geo-nftables.nft"
@@ -407,459 +407,6 @@ EOF
 
     echo -e "  ${GREEN}${BOLD}CPU ${cc}核全部参与网络处理，火力全开！${NC}"
     echo ""
-}
-
-declare -a PF_RULES=()
-PF_TARGET_FAMILY=""; PF_TARGET_INPUT=""; PF_TARGET_IP=""
-PF_RANGE_START=""; PF_RANGE_END=""
-
-pf_validate_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
-}
-
-pf_validate_ipv4() {
-    local ip="$1" o
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    [[ "$ip" =~ (^|\.)0[0-9] ]] && return 1
-    local IFS='.'; read -ra o <<< "$ip"
-    for n in "${o[@]}"; do [ "$n" -le 255 ] 2>/dev/null || return 1; done
-}
-
-pf_validate_ipv6() {
-    local ip="$1"
-    [[ "$ip" == *:* ]] || return 1
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - "$ip" <<'PY' >/dev/null 2>&1
-import ipaddress, sys
-ipaddress.IPv6Address(sys.argv[1])
-PY
-        return $?
-    fi
-    getent ahostsv6 "$ip" >/dev/null 2>&1
-}
-
-pf_validate_domain() {
-    local domain="${1%.}" label
-    [[ -n "$domain" && ${#domain} -le 253 && "$domain" == *.* ]] || return 1
-    [[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
-    local IFS='.'; read -ra labels <<< "$domain"
-    for label in "${labels[@]}"; do
-        [[ -n "$label" && ${#label} -le 63 ]] || return 1
-        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
-    done
-}
-
-pf_resolve_domain_ip() {
-    local family="$1" domain="$2"
-    if [ "$family" = "ip6" ]; then
-        getent ahostsv6 "$domain" 2>/dev/null | awk '$1 ~ /:/ {print $1; exit}'
-    else
-        getent ahostsv4 "$domain" 2>/dev/null | awk '$1 ~ /^[0-9.]+$/ {print $1; exit}'
-    fi
-}
-
-pf_fmt_addr_port() {
-    local family="$1" addr="$2" port="$3"
-    [ "$family" = "ip6" ] && printf '[%s]:%s' "$addr" "$port" || printf '%s:%s' "$addr" "$port"
-}
-
-pf_fmt_port_range() {
-    [ "$1" = "$2" ] && printf '%s' "$1" || printf '%s-%s' "$1" "$2"
-}
-
-pf_fmt_target() {
-    local family="$1" target="$2" ip="$3" ps="$4" pe="$5"
-    local port_range resolved
-    port_range=$(pf_fmt_port_range "$ps" "$pe")
-    resolved=$(pf_fmt_addr_port "$family" "$ip" "$port_range")
-    [ "$target" != "$ip" ] && printf '%s (%s)' "$target" "$resolved" || printf '%s' "$resolved"
-}
-
-pf_detect_pkg_manager() {
-    command -v apt-get >/dev/null 2>&1 && { echo apt; return; }
-    command -v dnf >/dev/null 2>&1 && { echo dnf; return; }
-    command -v yum >/dev/null 2>&1 && { echo yum; return; }
-    command -v pacman >/dev/null 2>&1 && { echo pacman; return; }
-    echo unknown
-}
-
-pf_ensure_nftables() {
-    command -v nft >/dev/null 2>&1 && return 0
-    echo -e "  ${YELLOW}[!] 未检测到 nftables${NC}"
-    confirm_action "是否现在安装 nftables?" || return 1
-    case "$(pf_detect_pkg_manager)" in
-        apt) apt-get update -y && apt-get install -y nftables ;;
-        dnf) dnf install -y nftables ;;
-        yum) yum install -y nftables ;;
-        pacman) pacman -Sy --noconfirm nftables ;;
-        *) echo -e "  ${RED}无法识别包管理器，请手动安装 nftables${NC}"; return 1 ;;
-    esac
-    command -v nft >/dev/null 2>&1
-}
-
-pf_set_sysctl_kv() {
-    local key="$1" value="$2"
-    init_config_dir
-    touch "$SYSCTL_CONF" 2>/dev/null || return
-    if grep -qE "^[[:space:]]*${key//./\\.}[[:space:]]*=" "$SYSCTL_CONF" 2>/dev/null; then
-        sed -i -E "s|^[[:space:]]*${key//./\\.}[[:space:]]*=.*|${key}=${value}|" "$SYSCTL_CONF" 2>/dev/null || true
-    else
-        echo "${key}=${value}" >> "$SYSCTL_CONF"
-    fi
-}
-
-pf_enable_forwarding() {
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
-    pf_set_sysctl_kv net.ipv4.ip_forward 1
-    pf_set_sysctl_kv net.ipv6.conf.all.forwarding 1
-    ln -sf "$SYSCTL_CONF" /etc/sysctl.d/99-network-optimize.conf 2>/dev/null || true
-}
-
-pf_load_rules() {
-    PF_RULES=()
-    [ -f "$PF_NFT" ] || return
-    local line
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*rule:[[:space:]]*([0-9]+)\|([0-9]+)\|(ip6?)\|([^|]+)\|([^|]+)\|([0-9]+)\|([0-9]+)[[:space:]]*$ ]]; then
-            PF_RULES+=("${BASH_REMATCH[1]}|${BASH_REMATCH[2]}|${BASH_REMATCH[3]}|${BASH_REMATCH[4]}|${BASH_REMATCH[5]}|${BASH_REMATCH[6]}|${BASH_REMATCH[7]}")
-        fi
-    done < "$PF_NFT"
-}
-
-pf_rule_overlaps() {
-    local ps="$1" pe="$2" family="$3" rule rs re rf rt rip ts te
-    for rule in "${PF_RULES[@]}"; do
-        IFS='|' read -r rs re rf rt rip ts te <<< "$rule"
-        [ "$rf" = "$family" ] || continue
-        if [ "$ps" -le "$re" ] 2>/dev/null && [ "$pe" -ge "$rs" ] 2>/dev/null; then
-            return 0
-        fi
-    done
-    return 1
-}
-
-pf_write_conf() {
-    init_config_dir
-    local has4=0 has6=0 rule ps pe family target ip ts te
-    for rule in "${PF_RULES[@]}"; do
-        IFS='|' read -r ps pe family target ip ts te <<< "$rule"
-        [ "$family" = "ip6" ] && has6=1 || has4=1
-    done
-
-    cat > "$PF_NFT" <<EOF
-#!/usr/sbin/nft -f
-EOF
-
-    if [ "$has4" -eq 1 ]; then
-        cat >> "$PF_NFT" <<EOF
-
-table ip ${PF_TABLE} {
-    chain prerouting {
-        type nat hook prerouting priority -100; policy accept;
-EOF
-        for rule in "${PF_RULES[@]}"; do
-            IFS='|' read -r ps pe family target ip ts te <<< "$rule"
-            [ "$family" = "ip" ] || continue
-            local lp tp dnat_to
-            lp=$(pf_fmt_port_range "$ps" "$pe")
-            tp=$(pf_fmt_port_range "$ts" "$te")
-            if [ "$ps" = "$pe" ]; then dnat_to="${ip}:${ts}"; else dnat_to="${ip}"; fi
-            cat >> "$PF_NFT" <<EOF
-
-        # rule: ${ps}|${pe}|${family}|${target}|${ip}|${ts}|${te}
-        # 转发: 本机:${lp} -> $(pf_fmt_target "$family" "$target" "$ip" "$ts" "$te")
-        tcp dport ${lp} dnat to ${dnat_to}
-        udp dport ${lp} dnat to ${dnat_to}
-EOF
-        done
-        cat >> "$PF_NFT" <<EOF
-    }
-
-    chain postrouting {
-        type nat hook postrouting priority 100; policy accept;
-EOF
-        for rule in "${PF_RULES[@]}"; do
-            IFS='|' read -r ps pe family target ip ts te <<< "$rule"
-            [ "$family" = "ip" ] || continue
-            local tp
-            tp=$(pf_fmt_port_range "$ts" "$te")
-            cat >> "$PF_NFT" <<EOF
-
-        ip daddr ${ip} tcp dport ${tp} ct status dnat masquerade
-        ip daddr ${ip} udp dport ${tp} ct status dnat masquerade
-EOF
-        done
-        cat >> "$PF_NFT" <<EOF
-    }
-}
-EOF
-    fi
-
-    if [ "$has6" -eq 1 ]; then
-        cat >> "$PF_NFT" <<EOF
-
-table ip6 ${PF_TABLE} {
-    chain prerouting {
-        type nat hook prerouting priority -100; policy accept;
-EOF
-        for rule in "${PF_RULES[@]}"; do
-            IFS='|' read -r ps pe family target ip ts te <<< "$rule"
-            [ "$family" = "ip6" ] || continue
-            local lp tp dnat_to
-            lp=$(pf_fmt_port_range "$ps" "$pe")
-            tp=$(pf_fmt_port_range "$ts" "$te")
-            if [ "$ps" = "$pe" ]; then dnat_to="[${ip}]:${ts}"; else dnat_to="${ip}"; fi
-            cat >> "$PF_NFT" <<EOF
-
-        # rule: ${ps}|${pe}|${family}|${target}|${ip}|${ts}|${te}
-        # 转发: 本机:${lp} -> $(pf_fmt_target "$family" "$target" "$ip" "$ts" "$te")
-        tcp dport ${lp} dnat to ${dnat_to}
-        udp dport ${lp} dnat to ${dnat_to}
-EOF
-        done
-        cat >> "$PF_NFT" <<EOF
-    }
-
-    chain postrouting {
-        type nat hook postrouting priority 100; policy accept;
-EOF
-        for rule in "${PF_RULES[@]}"; do
-            IFS='|' read -r ps pe family target ip ts te <<< "$rule"
-            [ "$family" = "ip6" ] || continue
-            local tp
-            tp=$(pf_fmt_port_range "$ts" "$te")
-            cat >> "$PF_NFT" <<EOF
-
-        ip6 daddr ${ip} tcp dport ${tp} ct status dnat masquerade
-        ip6 daddr ${ip} udp dport ${tp} ct status dnat masquerade
-EOF
-        done
-        cat >> "$PF_NFT" <<EOF
-    }
-}
-EOF
-    fi
-}
-
-pf_reload_rules() {
-    command -v nft >/dev/null 2>&1 || return 1
-    nft delete table ip "$PF_TABLE" 2>/dev/null || true
-    nft delete table ip6 "$PF_TABLE" 2>/dev/null || true
-    if [ -f "$PF_NFT" ] && grep -q '^table ' "$PF_NFT"; then
-        nft -f "$PF_NFT" || return 1
-    fi
-    return 0
-}
-
-pf_status_state() {
-    if command -v nft >/dev/null 2>&1 && { nft list table ip "$PF_TABLE" >/dev/null 2>&1 || nft list table ip6 "$PF_TABLE" >/dev/null 2>&1; }; then
-        echo "运行中"
-    elif [ -f "$PF_NFT" ] && grep -q '# rule:' "$PF_NFT" 2>/dev/null; then
-        echo "已配置未加载"
-    elif iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT; then
-        echo "旧iptables运行中"
-    else
-        echo "未启用"
-    fi
-}
-
-pf_read_port_range() {
-    local prompt="$1" default="$2" input start end
-    while true; do
-        echo -ne "  ${WHITE}${prompt} [默认 ${default}]: ${NC}"; read input
-        [ -z "$input" ] && input="$default"
-        input="${input/:/-}"
-        if [[ "$input" =~ ^([0-9]+)(-([0-9]+))?$ ]]; then
-            start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}"
-            if pf_validate_port "$start" && pf_validate_port "$end" && [ "$end" -ge "$start" ] 2>/dev/null; then
-                PF_RANGE_START="$start"; PF_RANGE_END="$end"; return 0
-            fi
-        fi
-        echo -e "  ${RED}无效端口范围，请输入 23 或 23-65535${NC}"
-    done
-}
-
-pf_read_target_address() {
-    local raw ip4 ip6 prefer
-    while true; do
-        echo -ne "  ${WHITE}目标 IP 地址或域名: ${NC}"; read raw
-        raw="${raw%.}"
-        if pf_validate_ipv4 "$raw"; then PF_TARGET_FAMILY="ip"; PF_TARGET_INPUT="$raw"; PF_TARGET_IP="$raw"; return 0; fi
-        if pf_validate_ipv6 "$raw"; then PF_TARGET_FAMILY="ip6"; PF_TARGET_INPUT="$raw"; PF_TARGET_IP="$raw"; return 0; fi
-        if pf_validate_domain "$raw"; then
-            ip4=$(pf_resolve_domain_ip ip "$raw")
-            ip6=$(pf_resolve_domain_ip ip6 "$raw")
-            [ -z "$ip4" ] && [ -z "$ip6" ] && { echo -e "  ${RED}域名解析失败${NC}"; continue; }
-            if [ -n "$ip4" ] && [ -n "$ip6" ]; then
-                echo -e "  ${DIM}解析结果:${NC}"
-                echo -e "  ${DIM}4) A    ${ip4}${NC}"
-                echo -e "  ${DIM}6) AAAA ${ip6}${NC}"
-                while true; do
-                    echo -ne "  ${WHITE}请选择 IPv4(A) 或 IPv6(AAAA) [默认 6]: ${NC}"; read prefer
-                    prefer="${prefer:-6}"
-                    case "$prefer" in
-                        4) PF_TARGET_FAMILY="ip"; PF_TARGET_IP="$ip4"; break ;;
-                        6) PF_TARGET_FAMILY="ip6"; PF_TARGET_IP="$ip6"; break ;;
-                        *) echo -e "  ${RED}请输入 4 或 6${NC}" ;;
-                    esac
-                done
-            elif [ -n "$ip6" ]; then
-                PF_TARGET_FAMILY="ip6"; PF_TARGET_IP="$ip6"
-            else
-                PF_TARGET_FAMILY="ip"; PF_TARGET_IP="$ip4"
-            fi
-            PF_TARGET_INPUT="$raw"
-            echo -e "  ${GREEN}[OK]${NC} ${raw} -> ${PF_TARGET_IP}"
-            return 0
-        fi
-        echo -e "  ${RED}地址无效，请输入 IPv4、IPv6 或域名${NC}"
-    done
-}
-
-port_forward_main() {
-    while true; do
-        echo ""
-        local f_status; f_status=$(pf_status_state)
-        echo -e "  ${BOLD}${CYAN}端口转发 (nftables / IPv4+IPv6 / 域名)${NC}"
-        echo -e "  ${DIM}当前状态: ${WHITE}$f_status${NC}"; echo ""
-        select_menu "请选择" \
-            "查看当前转发规则" \
-            "新增端口转发" \
-            "删除端口转发" \
-            "清空所有转发规则" \
-            "诊断 / 自检" \
-            "返回主菜单"
-        case $? in
-            0) port_forward_status ;;
-            1) port_forward_setup ;;
-            2) port_forward_delete ;;
-            3) port_forward_clear ;;
-            4) port_forward_diagnose ;;
-            5) return ;;
-        esac
-        echo -ne "  ${DIM}回车继续...${NC}"; read -r
-    done
-}
-
-port_forward_setup() {
-    echo ""; echo -e "  ${BOLD}${CYAN}新增 nftables 端口转发${NC}"; echo ""
-    pf_ensure_nftables || return
-    pf_enable_forwarding
-    pf_load_rules
-
-    pf_read_port_range "本机端口范围" "23-65535"
-    local ps="$PF_RANGE_START" pe="$PF_RANGE_END"
-    pf_read_target_address
-    local family="$PF_TARGET_FAMILY" target="$PF_TARGET_INPUT" tip="$PF_TARGET_IP"
-
-    local default_target; default_target=$(pf_fmt_port_range "$ps" "$pe")
-    while true; do
-        pf_read_port_range "目标端口范围" "$default_target"
-        local ts="$PF_RANGE_START" te="$PF_RANGE_END"
-        if [ "$ps" = "$pe" ]; then
-            break
-        fi
-        if [ "$ps" = "$ts" ] && [ "$pe" = "$te" ]; then
-            break
-        fi
-        echo -e "  ${YELLOW}[!] 端口段仅支持同端口段转发，例如 ${ps}-${pe} -> ${ps}-${pe}${NC}"
-        echo -e "  ${DIM}单端口可以转发到不同目标端口；整段端口平移请拆成少量单端口规则。${NC}"
-    done
-
-    local ts="$PF_RANGE_START" te="$PF_RANGE_END"
-    if pf_rule_overlaps "$ps" "$pe" "$family"; then
-        echo -e "  ${RED}同地址族 ${family} 的本机端口范围已存在或重叠，请先删除旧规则。${NC}"
-        return
-    fi
-
-    echo -e "  ${DIM}-----------------------------------"
-    echo -e "  本机端口:   $(pf_fmt_port_range "$ps" "$pe")"
-    echo -e "  目标地址:   $(pf_fmt_target "$family" "$target" "$tip" "$ts" "$te")"
-    echo -e "  地址族:     $family"
-    echo -e "  协议:       TCP & UDP"
-    echo -e "  -----------------------------------${NC}"
-    confirm_action "确认添加转发?" || return
-
-    PF_RULES+=("${ps}|${pe}|${family}|${target}|${tip}|${ts}|${te}")
-    pf_write_conf
-    if pf_reload_rules; then
-        install_service >/dev/null 2>&1 || true
-        echo -e "  ${GREEN}[OK]${NC} 转发已生效，并接入 network-optimizer 开机加载。"
-    else
-        echo -e "  ${RED}[X] nftables 加载失败，请检查: ${PF_NFT}${NC}"
-    fi
-}
-
-port_forward_status() {
-    echo ""; echo -e "  ${BOLD}${CYAN}当前 nftables 转发规则:${NC}"
-    pf_load_rules
-    if [ "${#PF_RULES[@]}" -eq 0 ]; then
-        echo -e "  ${DIM}无${NC}"
-    else
-        printf "  ${BOLD}%-4s %-11s %-6s %-13s %s${NC}\n" "序号" "本机端口" "类型" "协议" "目标"
-        local i=1 rule ps pe family target ip ts te
-        for rule in "${PF_RULES[@]}"; do
-            IFS='|' read -r ps pe family target ip ts te <<< "$rule"
-            printf "  %-4s %-11s %-6s %-13s %s\n" "$i" "$(pf_fmt_port_range "$ps" "$pe")" "$family" "tcp+udp" "$(pf_fmt_target "$family" "$target" "$ip" "$ts" "$te")"
-            i=$(( i + 1 ))
-        done
-    fi
-    echo ""
-    if command -v nft >/dev/null 2>&1; then
-        nft list table ip "$PF_TABLE" >/dev/null 2>&1 && { echo -e "  ${DIM}table ip ${PF_TABLE}:${NC}"; nft list table ip "$PF_TABLE" | sed 's/^/  /'; }
-        nft list table ip6 "$PF_TABLE" >/dev/null 2>&1 && { echo -e "  ${DIM}table ip6 ${PF_TABLE}:${NC}"; nft list table ip6 "$PF_TABLE" | sed 's/^/  /'; }
-    fi
-    if iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT; then
-        echo -e "  ${YELLOW}[!] 检测到旧 iptables DNAT 规则，可能与 nftables 转发并存。${NC}"
-    fi
-}
-
-port_forward_delete() {
-    echo ""; echo -e "  ${BOLD}${CYAN}删除端口转发${NC}"
-    pf_load_rules
-    [ "${#PF_RULES[@]}" -eq 0 ] && { echo -e "  ${DIM}当前没有转发规则${NC}"; return; }
-    port_forward_status
-    local choice
-    echo -ne "  ${WHITE}请输入要删除的序号 (0取消): ${NC}"; read choice
-    [[ "$choice" =~ ^[0-9]+$ ]] || { echo -e "  ${RED}无效序号${NC}"; return; }
-    [ "$choice" -eq 0 ] && return
-    [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le "${#PF_RULES[@]}" ] 2>/dev/null || { echo -e "  ${RED}无效序号${NC}"; return; }
-    unset 'PF_RULES[$((choice-1))]'
-    PF_RULES=("${PF_RULES[@]}")
-    pf_write_conf
-    pf_reload_rules && echo -e "  ${GREEN}[OK] 已删除${NC}" || echo -e "  ${RED}[X] 重载失败${NC}"
-}
-
-port_forward_clear() {
-    confirm_action "确定清空所有 nftables 端口转发规则?" || return
-    PF_RULES=()
-    rm -f "$PF_NFT"
-    if command -v nft >/dev/null 2>&1; then
-        nft delete table ip "$PF_TABLE" 2>/dev/null || true
-        nft delete table ip6 "$PF_TABLE" 2>/dev/null || true
-    fi
-    echo -e "  ${GREEN}[OK] 转发规则已清空${NC}"
-    if iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT; then
-        echo -e "  ${YELLOW}[!] 仍检测到旧 iptables DNAT；为避免误删其他业务，本操作未清空 iptables。${NC}"
-    fi
-}
-
-port_forward_diagnose() {
-    echo ""; echo -e "  ${BOLD}${CYAN}端口转发诊断${NC}"; echo ""
-    command -v nft >/dev/null 2>&1 && echo -e "  ${GREEN}[OK]${NC} nftables: $(nft --version 2>/dev/null)" || echo -e "  ${RED}[X]${NC} nftables 未安装"
-    [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = "1" ] && echo -e "  ${GREEN}[OK]${NC} IPv4 转发已开启" || echo -e "  ${YELLOW}[!]${NC} IPv4 转发未开启"
-    [ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null)" = "1" ] && echo -e "  ${GREEN}[OK]${NC} IPv6 转发已开启" || echo -e "  ${YELLOW}[!]${NC} IPv6 转发未开启"
-    echo -e "  ${DIM}配置文件:${NC} ${PF_NFT}"
-    pf_load_rules
-    echo -e "  ${DIM}规则数量:${NC} ${#PF_RULES[@]}"
-    command -v nft >/dev/null 2>&1 && {
-        nft list table ip "$PF_TABLE" >/dev/null 2>&1 && echo -e "  ${GREEN}[OK]${NC} IPv4 转发表已加载" || echo -e "  ${DIM}[--]${NC} IPv4 转发表未加载"
-        nft list table ip6 "$PF_TABLE" >/dev/null 2>&1 && echo -e "  ${GREEN}[OK]${NC} IPv6 转发表已加载" || echo -e "  ${DIM}[--]${NC} IPv6 转发表未加载"
-    }
-    if iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT; then
-        echo -e "  ${YELLOW}[!] 存在旧 iptables DNAT 规则，建议确认是否仍需保留。${NC}"
-    fi
 }
 
 apply_initcwnd() {
@@ -1259,8 +806,7 @@ show_status() {
     echo -e "  守护: ${BOLD}${enf}${NC}"
     local game_net=$(systemctl is-active gaming-net-apply.service 2>/dev/null || echo "inactive")
     echo -e "  游戏UDP增强: ${BOLD}${game_net}${NC}"
-    local fwd_status; fwd_status=$(pf_status_state)
-    echo -e "  转发: ${BOLD}${fwd_status}${NC} | Ping: ${BOLD}$(ping_status_str)${NC}"
+    echo -e "  Ping: ${BOLD}$(ping_status_str)${NC}"
     echo ""; nstat -sz TcpRetransSegs 2>/dev/null | sed 's/^/  /' || true; echo ""
 }
 
@@ -1333,7 +879,6 @@ service_start() {
     [ -f "$SYSCTL_CONF" ] && sysctl --system >/dev/null 2>&1
     [ -f "$SYSCTL_CONF" ] && apply_initcwnd >/dev/null 2>&1
     install_initcwnd_enforcer >/dev/null 2>&1
-    [ -f "$PF_NFT" ] && pf_reload_rules >/dev/null 2>&1
 }
 service_stop() { :; }
 
@@ -1356,7 +901,6 @@ reload_network() {
     [ -f "$SYSCTL_CONF" ] && apply_initcwnd
     install_initcwnd_enforcer
     systemctl is-enabled gaming-net-apply.service >/dev/null 2>&1 && run_cmd "游戏UDP运行时增强" systemctl restart gaming-net-apply.service
-    [ -f "$PF_NFT" ] && run_cmd "端口转发重载" pf_reload_rules
     echo -e "  ${GREEN}${BOLD}完成${NC} | $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) rmem$(( $(sysctl -n net.core.rmem_max 2>/dev/null) / 1048576 ))MB"; echo ""
 }
 
@@ -1486,8 +1030,6 @@ interactive_main() {
         echo ""
         detect_bbr_version
         [ -f "$PROFILE_CONF" ] && { source "$PROFILE_CONF"; echo -e "  ${GREEN}[ON]${NC} BBR优化:  ${WHITE}$SYSCTL_PROFILE_NAME${NC}  ${DIM}[内核 ${BBR_VER_LABEL}]${NC}"; } || echo -e "  ${DIM}[--] BBR优化:  未配置  [内核 ${BBR_VER_LABEL}]${NC}"
-        local fwd_state; fwd_state=$(pf_status_state)
-        [ "$fwd_state" = "运行中" ] && echo -e "  ${GREEN}[ON]${NC} 端口转发:  ${WHITE}${fwd_state}${NC}" || echo -e "  ${DIM}[--] 端口转发:  ${fwd_state}${NC}"
         local pcur=$(ping_status_str)
         case "$pcur" in
             "全允许") echo -e "  ${DIM}[--] Ping屏蔽:  全允许${NC}";;
@@ -1500,7 +1042,6 @@ interactive_main() {
         select_menu "请选择操作" \
             "一键自动配置 (中转与落地高延迟请用手动链路)" \
             "手动链路向导" \
-            "端口转发" \
             "Ping 屏蔽控制 (当前: ${pcur})" \
             "查看系统状态" \
             "查看端口连接" \
@@ -1511,14 +1052,13 @@ interactive_main() {
         case $? in
             0)  auto_max_performance ;;
             1)  wizard_main ;;
-            2)  port_forward_main ;;
-            3)  ping_main; continue ;;
-            4)  show_status ;;
-            5)  port_monitor; continue ;;
-            6)  reload_network ;;
-            7)  toggle_service ;;
-            8)  restore_defaults ;;
-            9)  rst; exit 0 ;;
+            2)  ping_main; continue ;;
+            3)  show_status ;;
+            4)  port_monitor; continue ;;
+            5)  reload_network ;;
+            6)  toggle_service ;;
+            7)  restore_defaults ;;
+            8)  rst; exit 0 ;;
         esac
         echo ""
         echo -ne "  ${DIM}回车返回主菜单...${NC}"; read -r
