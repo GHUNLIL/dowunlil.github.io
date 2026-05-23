@@ -5,7 +5,7 @@
 # 用法: sudo bash bbr.sh [命令]
 # ============================================================
 
-VERSION="v1.4"
+VERSION="v1.5"
 UPDATE_URL="https://raw.githubusercontent.com/GHUNLIL/dowunlil.github.io/main/bbr.sh"
 CONFIG_DIR="/etc/network-optimizer"
 SYSCTL_CONF="$CONFIG_DIR/sysctl-optimize.conf"
@@ -25,7 +25,7 @@ rst() { tput cnorm 2>/dev/null; stty sane 2>/dev/null; }
 self_update_once() {
     [ "${BBR_SELF_UPDATED:-0}" = "1" ] && return 0
     # 开机/服务等非交互入口不自更新，避免启动期联网失败或拉到坏脚本把开机服务跑挂
-    case "${1:-}" in start|service-start|stop|service-stop|status) return 0;; esac
+    case "${1:-}" in start|service-start|stop|service-stop|status|uninstall) return 0;; esac
     command -v wget >/dev/null 2>&1 || return 0
 
     local self tmp
@@ -205,9 +205,10 @@ calculate_and_generate() {
     [ $max -lt 16777216 ] && max=16777216
     [ $max -gt 536870912 ] && max=536870912
 
-    # ECN: BBR1 关闭 (老旧路由器兼容)；BBR3 支持精确 ECN，可开启提升性能
+    # ECN: BBR1 关闭(老旧路由器兼容); BBR3 设 2=只被动接受(对端请求才用),
+    # 避免跨境多跳路径上主动协商(=1)踩到 ECN 黑洞导致连接变慢
     local ecn_val=0
-    [ "$BBR_VER" = "bbr3" ] && ecn_val=1
+    [ "$BBR_VER" = "bbr3" ] && ecn_val=2
 
     # tcp_notsent_lowat: 应用最多堆 16KB-256KB 未发送数据在内核里，超过则 write() 阻塞
     # 工业最佳实践 (Cloudflare/Google): 固定低范围而非跟带宽线性放大
@@ -230,7 +231,6 @@ calculate_and_generate() {
     local udpmm=$(( udp_max_pages * 3 / 4 ))
     local udpmax=$udp_max_pages
 
-    local nfconn=$(clamp $(( MEM_TOTAL_KB / 2 )) 1048576 16777216)
     local omem=$(clamp $(( mbw * 256 )) 262144 4194304)
 
     local bp=0 br=0
@@ -238,7 +238,13 @@ calculate_and_generate() {
         [ $mbw -ge 20 ] && { bp=$(clamp $(( mbw / 5 )) 20 200); br=$bp; }
     fi
 
-    local initcwnd=128
+    # initcwnd 按最大 RTT 自适应: 本地链路大窗口秒开, 跨境/高丢包链路收敛防突发重传雪崩
+    local maxrtt=$up_rtt; [ "$down_rtt" -gt "$maxrtt" ] 2>/dev/null && maxrtt=$down_rtt
+    local initcwnd=32
+    if   [ "$maxrtt" -le 10 ] 2>/dev/null; then initcwnd=128
+    elif [ "$maxrtt" -le 50 ] 2>/dev/null; then initcwnd=64
+    elif [ "$maxrtt" -le 120 ] 2>/dev/null; then initcwnd=32
+    else initcwnd=20; fi
 
     cat << EOF
 # ============================================================
@@ -270,7 +276,7 @@ net.ipv4.tcp_min_rtt_wlen = 60
 
 # --- 跨国链路 ---
 net.ipv4.tcp_max_reordering = 1000
-# ECN: BBR1 关闭(老旧路由器兼容)，BBR3 开启(精确响应提升性能)
+# ECN: BBR1=0 关闭; BBR3=2 被动接受(主动协商易在跨境路径踩黑洞)
 net.ipv4.tcp_ecn = $ecn_val
 net.ipv4.tcp_mtu_probing = 1
 
@@ -290,7 +296,7 @@ net.ipv4.ip_local_port_range = 1024 65535
 
 # --- 网卡调度 ---
 net.core.flow_limit_table_len = 8192
-$([ "$bp" -gt 0 ] && echo "# 低延迟机房启用 busy_poll
+$([ "$bp" -gt 0 ] && echo "# 低延迟机房启用 busy_poll (会增加CPU占用与功耗, 小核VPS慎用)
 net.core.busy_poll = $bp
 net.core.busy_read = $br")
 
@@ -310,12 +316,6 @@ net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
 
-# --- nf_conntrack ---
-net.netfilter.nf_conntrack_max = $nfconn
-net.netfilter.nf_conntrack_tcp_timeout_established = 1200
-net.netfilter.nf_conntrack_udp_timeout = 60
-net.netfilter.nf_conntrack_udp_timeout_stream = 300
-
 # --- 内存 ---
 vm.swappiness = 1
 
@@ -330,6 +330,9 @@ role_ix_sysctl_overrides() {
 # --- 角色增强: IX专线 / 高并发 UDP 中转 ---
 net.core.netdev_max_backlog = 65536
 net.netfilter.nf_conntrack_max = 2097152
+net.netfilter.nf_conntrack_tcp_timeout_established = 1200
+net.netfilter.nf_conntrack_udp_timeout = 60
+net.netfilter.nf_conntrack_udp_timeout_stream = 300
 net.ipv6.conf.all.forwarding = 1
 net.ipv6.conf.default.forwarding = 1
 net.ipv6.conf.all.accept_ra = 2
@@ -347,6 +350,9 @@ net.ipv4.tcp_rmem = 4096 87380 33554432
 net.ipv4.tcp_wmem = 4096 65536 33554432
 net.core.netdev_max_backlog = 8192
 net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 1200
+net.netfilter.nf_conntrack_udp_timeout = 60
+net.netfilter.nf_conntrack_udp_timeout_stream = 300
 net.ipv6.conf.all.forwarding = 1
 net.ipv6.conf.default.forwarding = 1
 net.ipv6.conf.all.accept_ra = 2
@@ -424,13 +430,18 @@ apply_sysctl_config() {
     fi
     check_memory_and_swap
 
-    modprobe nf_conntrack 2>/dev/null
     mkdir -p /etc/modules-load.d
-    echo -e "tcp_bbr\nnf_conntrack" > /etc/modules-load.d/network-optimize.conf
+    # 仅当生成的配置实际包含 conntrack 参数(转发/IX 等角色)时才加载 nf_conntrack,
+    # 纯应用层代理(前置/落地/通用)不强开, 避免无谓开销与 conntrack 表打满风险
+    if echo "$config" | grep -q nf_conntrack; then
+        modprobe nf_conntrack 2>/dev/null
+        echo -e "tcp_bbr\nnf_conntrack" > /etc/modules-load.d/network-optimize.conf
+    else
+        echo "tcp_bbr" > /etc/modules-load.d/network-optimize.conf
+    fi
 
     if confirm_action "确认写入并应用?"; then
         init_config_dir
-        [ ! -f "$CONFIG_DIR/sysctl-backup.conf" ] && { sysctl -a > "$CONFIG_DIR/sysctl-backup.conf" 2>/dev/null; echo -e "  ${GREEN}[OK]${NC} 已备份"; }
         mkdir -p /etc/security/limits.d
         echo -e "* soft nofile 1048576\n* hard nofile 1048576\nroot soft nofile 1048576\nroot hard nofile 1048576" > /etc/security/limits.d/99-network-optimize.conf
         sed -i '/DefaultLimitNOFILE/d' /etc/systemd/system.conf 2>/dev/null
@@ -546,9 +557,8 @@ speedtest_probe() {
     }
     _test_url "https://speed.cloudflare.com/__down?bytes=100000000" "Cloudflare 100MB" 30
     _test_url "http://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" "Google CDN" 10
-    if [ "$max_mbps" -gt 2000 ] 2>/dev/null; then
-        _test_url "https://speed.cloudflare.com/__down?bytes=10000000000" "Cloudflare 10GB峰值" 12
-    elif [ "$max_mbps" -gt 500 ] 2>/dev/null; then
+    # 封顶 1GB, 避免高带宽机一次测速烧掉数 GB 流量
+    if [ "$max_mbps" -gt 500 ] 2>/dev/null; then
         _test_url "https://speed.cloudflare.com/__down?bytes=1000000000" "Cloudflare 1GB" 15
     else
         _test_url "https://speed.cloudflare.com/__down?bytes=10000000" "Cloudflare 10MB" 15
@@ -569,20 +579,30 @@ auto_max_performance() {
 
     apply_temp_boost
 
-    local best_rtt=200
+    local best_rtt=200 rtt_ok=0
     echo -ne "  ${WHITE}延迟:${NC}  探测中..."
     for target in 8.8.8.8 1.1.1.1 142.250.80.46; do
         local ms=$(ping -c 2 -W 3 -q "$target" 2>/dev/null | awk -F'/' '/rtt/{printf "%.0f",$5}')
         if [ -n "$ms" ] && [ "$ms" -gt 0 ] 2>/dev/null; then
-            local rtt_val=$ms
-            [ $rtt_val -lt $best_rtt ] && best_rtt=$rtt_val
+            rtt_ok=1
+            [ "$ms" -lt "$best_rtt" ] && best_rtt=$ms
         fi
     done
-    [ $best_rtt -lt 20 ] && best_rtt=20
-    echo -e "\r  ${WHITE}延迟:${NC}  ${BOLD}RTT ${best_rtt}ms${NC}                    "
+    if [ "$rtt_ok" -eq 0 ]; then
+        echo -e "\r  ${YELLOW}[!] 无法自动探测 RTT (可能禁 ICMP)${NC}                    "
+        echo -e "  ${DIM}自动估算会失真; 跨境中转/落地建议改用【手动链路向导】${NC}"
+        read_int "本机到主要对端(下一跳)的 RTT (ms, ping 显示的数字)" "50" "best_rtt"
+    else
+        [ "$best_rtt" -lt 20 ] && best_rtt=20
+        echo -e "\r  ${WHITE}延迟:${NC}  ${BOLD}RTT ${best_rtt}ms${NC}                    "
+    fi
 
-    echo -ne "  ${WHITE}带宽:${NC}  测速中..."
-    local bw=$(speedtest_probe)
+    echo -e "  ${DIM}测速会从 Cloudflare/Google 下载约 1~1.5GB 流量${NC}"
+    local bw=0
+    if confirm_action "跑带宽测速? (流量计费机可选否, 改为手动填写)"; then
+        echo -ne "  ${WHITE}带宽:${NC}  测速中..."
+        bw=$(speedtest_probe)
+    fi
     if [ "$bw" -gt 0 ] 2>/dev/null; then
         echo -e "\r  ${WHITE}带宽:${NC}  ${BOLD}${bw}Mbps${NC} (Cloudflare/Google实测)                  "
     else
@@ -800,7 +820,13 @@ show_status() {
     echo -e "  守护: ${BOLD}${enf}${NC}"
     local game_net=$(systemctl is-active gaming-net-apply.service 2>/dev/null || echo "inactive")
     echo -e "  游戏UDP增强: ${BOLD}${game_net}${NC}"
-    echo ""; nstat -sz TcpRetransSegs 2>/dev/null | sed 's/^/  /' || true; echo ""
+    local _o=$(awk '/^Tcp:/{o=$12} END{print o}' /proc/net/snmp 2>/dev/null)
+    local _r=$(awk '/^Tcp:/{r=$13} END{print r}' /proc/net/snmp 2>/dev/null)
+    if [ -n "$_o" ] && [ "$_o" -gt 0 ] 2>/dev/null; then
+        local _rate=$(awk "BEGIN{printf \"%.2f\", $_r*100/$_o}")
+        echo -e "  重传率: ${BOLD}${_rate}%${NC} ${DIM}(累计 RetransSegs ${_r} / OutSegs ${_o})${NC}"
+    fi
+    echo ""
 }
 
 # ==================== initcwnd 守护进程 ====================
@@ -901,6 +927,82 @@ port_rank() { echo ""; echo -e "  ${BOLD}${CYAN}[ 排行 ]${NC}"; echo -e "  ${W
     echo ""; echo -e "  ${WHITE}${BOLD}状态分布${NC}"; echo ""
     ss -tnH 2>/dev/null|awk '{print $1}'|sort|uniq -c|sort -rn|awk '{printf "  %-15s %s\n",$2,$1}'; echo ""; }
 
+# ==================== 链路诊断 ====================
+link_diagnose() {
+    echo ""; echo -e "  ${BOLD}${CYAN}链路诊断 (BBR / 丢包 / 重传)${NC}"; echo ""
+    detect_bbr_version
+    local cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    local qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    echo -e "  拥塞算法: ${BOLD}${cc}${NC} | 队列: ${BOLD}${qd}${NC} | 内核 BBR: ${BOLD}${BBR_VER_LABEL}${NC}"
+    [ "$cc" = "bbr" ] && echo -e "  ${GREEN}[OK]${NC} BBR 已启用" || echo -e "  ${YELLOW}[!]${NC} 当前拥塞算法不是 bbr"
+    echo ""
+    rst; local ip
+    echo -ne "  ${WHITE}输入对端 IP/域名 (留空看本机连接概况): ${NC}"; read -r ip
+
+    if [ -z "$ip" ]; then
+        echo ""; echo -e "  ${WHITE}${BOLD}TCP 连接状态分布${NC}"; echo ""
+        ss -tnH 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -rn | awk '{printf "  %-14s %s\n",$2,$1}'
+        local la=$(ss -tnH state last-ack 2>/dev/null | grep -c .)
+        local cw=$(ss -tnH state close-wait 2>/dev/null | grep -c .)
+        echo ""
+        if [ "${la:-0}" -gt 50 ] 2>/dev/null || [ "${cw:-0}" -gt 50 ] 2>/dev/null; then
+            echo -e "  ${YELLOW}[!] LAST-ACK=${la} CLOSE-WAIT=${cw} 偏多${NC}"
+            echo -e "  ${DIM}多为对端/链路在挥手阶段丢包, 或对端批量断连; 填某对端 IP 再测它的 retrans/rtt${NC}"
+        else
+            echo -e "  ${GREEN}[OK]${NC} 无明显僵尸连接堆积 (LAST-ACK=${la} CLOSE-WAIT=${cw})"
+        fi
+        echo ""; return
+    fi
+
+    echo ""
+    local n=$(ss -tnH "dst $ip" 2>/dev/null | grep -c .)
+    echo -e "  ${WHITE}${BOLD}到 ${ip} 的 TCP 连接: ${n} 条${NC} ${DIM}(下方 ss -ti 看 bbr/rtt/cwnd/retrans)${NC}"; echo ""
+    ss -tinp "dst $ip" 2>/dev/null | head -16 | sed 's/^/  /'
+    echo ""
+    echo -e "  ${WHITE}${BOLD}丢包/延迟 (ping x20)${NC}"; echo ""
+    local pres=$(ping -c 20 -i 0.2 -W 2 "$ip" 2>/dev/null)
+    if [ -n "$pres" ]; then
+        echo "$pres" | grep -E 'packet loss|rtt |round-trip' | sed 's/^/  /'
+    else
+        echo -e "  ${DIM}ping 无响应 (对端可能禁 ICMP)${NC}"
+    fi
+    echo ""
+    if command -v mtr >/dev/null 2>&1; then
+        echo -e "  ${WHITE}${BOLD}逐跳丢包 (mtr)${NC}"; echo ""
+        mtr -rwzbc 30 "$ip" 2>/dev/null | sed 's/^/  /'
+    else
+        echo -e "  ${DIM}未装 mtr, 逐跳定位可装: apt install -y mtr-tiny  或  yum install -y mtr${NC}"
+    fi
+    echo ""
+}
+
+# ==================== 卸载 / 还原 ====================
+uninstall_all() {
+    echo ""; echo -e "  ${BOLD}${YELLOW}卸载 / 还原${NC}"; echo ""
+    echo -e "  ${DIM}移除本脚本写入的全部 sysctl 配置与 systemd 单元, 并重载系统默认${NC}"
+    confirm_action "确认卸载?" || { echo -e "  ${DIM}已取消${NC}"; return; }
+
+    for u in initcwnd-enforcer.timer initcwnd-enforcer.service rps-optimize.service gaming-net-apply.service; do
+        systemctl disable --now "$u" >/dev/null 2>&1
+        rm -f "/etc/systemd/system/$u"
+    done
+    rm -f /usr/local/bin/enforce-initcwnd.sh /usr/local/bin/enforce-rps.sh "$GAME_NET_SCRIPT"
+
+    rm -f /etc/sysctl.d/99-network-optimize.conf
+    rm -f /etc/modules-load.d/network-optimize.conf
+    rm -f /etc/security/limits.d/99-network-optimize.conf
+    sed -i '/^DefaultLimitNOFILE=1048576/d' /etc/systemd/system.conf 2>/dev/null
+
+    rm -f "$SYSCTL_CONF" "$PROFILE_CONF"
+
+    systemctl daemon-reload >/dev/null 2>&1
+    sysctl --system >/dev/null 2>&1
+
+    echo -e "  ${GREEN}[OK]${NC} 已移除配置/单元并重载系统默认 sysctl"
+    echo -e "  ${DIM}注: 默认路由 initcwnd 需重启或手动 ip route 复位; /etc/fstab 里的 swap 未删除${NC}"
+    echo ""
+}
+
 # ==================== 主菜单 ====================
 interactive_main() {
     while true; do
@@ -918,15 +1020,19 @@ interactive_main() {
             "一键自动配置 (中转与落地高延迟请用手动链路)" \
             "查看系统状态" \
             "查看端口连接" \
+            "链路诊断 (BBR/丢包/重传)" \
             "刷新当前配置" \
+            "卸载 / 还原" \
             "退出"
         case $? in
             0)  wizard_main ;;
             1)  auto_max_performance ;;
             2)  show_status ;;
             3)  port_monitor; continue ;;
-            4)  reload_network ;;
-            5)  rst; exit 0 ;;
+            4)  link_diagnose ;;
+            5)  reload_network ;;
+            6)  uninstall_all ;;
+            7)  rst; exit 0 ;;
         esac
         echo ""
         echo -ne "  ${DIM}回车返回主菜单...${NC}"; read -r
@@ -938,6 +1044,8 @@ case "${1}" in
     status) show_status;;
     auto) auto_max_performance;;
     wizard) wizard_main;;
+    diag) link_diagnose;;
+    uninstall) uninstall_all;;
     ports) port_all;; ports-rank) port_rank;; "") interactive_main;;
-    *) echo "$VERSION | $0 [auto|wizard|status|ports]"; exit 1;;
+    *) echo "$VERSION | $0 [auto|wizard|status|ports|diag|uninstall]"; exit 1;;
 esac
