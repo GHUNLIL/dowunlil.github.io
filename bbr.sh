@@ -1,1051 +1,1120 @@
-#!/bin/bash
-# ============================================================
-# 专线网络优化工具 v1
-# wget -O bbr.sh https://raw.githubusercontent.com/GHUNLIL/dowunlil.github.io/main/bbr.sh && chmod +x bbr.sh && sudo bash bbr.sh
-# 用法: sudo bash bbr.sh [命令]
-# ============================================================
+#!/usr/bin/env bash
+set -euo pipefail
 
-VERSION="v1.5"
-UPDATE_URL="https://raw.githubusercontent.com/GHUNLIL/dowunlil.github.io/main/bbr.sh"
-CONFIG_DIR="/etc/network-optimizer"
-SYSCTL_CONF="$CONFIG_DIR/sysctl-optimize.conf"
-PROFILE_CONF="$CONFIG_DIR/profile.conf"
-GAME_NET_SCRIPT="/usr/local/sbin/gaming-net-apply.sh"
-GAME_NET_SERVICE="/etc/systemd/system/gaming-net-apply.service"
+VERSION="2026.05.24"
+MIB=1048576
+GIB=$((1024 * MIB))
+AUTO_TCP_CAP=$((2047 * MIB))
 
-[ "$(id -u)" -ne 0 ] && { echo "错误: 需要root权限"; exit 1; }
-trap 'tput cnorm 2>/dev/null; stty sane 2>/dev/null; echo; exit 0' INT TERM
+ROLE=""
+SCENE=""
+TARGET="speed"
+BUSINESS="mixed"
+STATEFUL="yes"
+LANDING_ROUTES="no"
+IPV6_RA="ask"
+MULTIPATH="yes"
+HANDSHAKE="yes"
+TFO_GLOBAL="no"
+LOCAL_TCP_TERMINATION="auto"
+BUSY_MODE="auto"
+APPLY_MODE="ask"
+UI_MODE="menu"
+OUT_DIR=""
 
-# ==================== 基础工具 ====================
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
-WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
+log() { printf '[*] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+die() { printf '[x] %s\n' "$*" >&2; exit 1; }
 
-rst() { tput cnorm 2>/dev/null; stty sane 2>/dev/null; }
+if [[ -t 1 && -n "${TERM:-}" && "${TERM:-}" != "dumb" ]] && command -v tput >/dev/null 2>&1; then
+  BOLD=$(tput bold || true)
+  DIM=$(tput dim || true)
+  RED=$(tput setaf 1 || true)
+  GREEN=$(tput setaf 2 || true)
+  YELLOW=$(tput setaf 3 || true)
+  BLUE=$(tput setaf 4 || true)
+  CYAN=$(tput setaf 6 || true)
+  RESET=$(tput sgr0 || true)
+else
+  BOLD=""
+  DIM=""
+  RED=""
+  GREEN=""
+  YELLOW=""
+  BLUE=""
+  CYAN=""
+  RESET=""
+fi
 
-self_update_once() {
-    [ "${BBR_SELF_UPDATED:-0}" = "1" ] && return 0
-    # 开机/服务等非交互入口不自更新，避免启动期联网失败或拉到坏脚本把开机服务跑挂
-    case "${1:-}" in start|service-start|stop|service-stop|status|uninstall) return 0;; esac
-    command -v wget >/dev/null 2>&1 || return 0
-
-    local self tmp
-    self=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
-    [ -n "$self" ] && [ -f "$self" ] && [ -w "$self" ] || return 0
-    tmp="${self}.update.$$"
-
-    echo -ne "  ${DIM}检查最新脚本版本(5秒超时)...${NC}"
-    # 校验: 非空 + shebang + 含关键函数 + 语法通过，否则视为下载损坏，绝不覆盖本地脚本
-    if timeout 5 wget -q -O "$tmp" "$UPDATE_URL" 2>/dev/null && [ -s "$tmp" ] \
-        && head -1 "$tmp" | grep -q '^#!' && grep -q 'self_update_once' "$tmp" \
-        && bash -n "$tmp" 2>/dev/null; then
-        chmod +x "$tmp" 2>/dev/null || true
-        mv -f "$tmp" "$self"
-        echo -e "\r  ${GREEN}[OK]${NC} 已拉取最新脚本，继续执行...       "
-        exec env BBR_SELF_UPDATED=1 bash "$self" "$@"
-    else
-        rm -f "$tmp" 2>/dev/null || true
-        echo -e "\r  ${YELLOW}[!]${NC} 未拉取到有效的最新版本，运行本地脚本。"
-    fi
+hr() {
+  printf '%*s\n' "${COLUMNS:-80}" '' | tr ' ' '-'
 }
 
-self_update_once "$@"
-
-run_cmd() {
-    local msg="$1"; shift
-    echo -ne "  ${WHITE}${msg} ... ${NC}"
-    "$@" && echo -e "${GREEN}[OK]${NC}" || { echo -e "${RED}[X]${NC}"; return 1; }
+pause_ui() {
+  local _
+  read -r -p "按 Enter 继续..." _ || true
 }
 
-clamp() { local v=$1 lo=$2 hi=$3; [ $v -lt $lo ] && v=$lo; [ $v -gt $hi ] && v=$hi; echo $v; }
-
-init_config_dir() { mkdir -p "$CONFIG_DIR"; }
-
-detect_interface() {
-    local i=$(ip route show default 2>/dev/null | awk '/default/{print $5;exit}')
-    [ -z "$i" ] && i=$(ip -o link show up | awk -F': ' '!/lo|ifb|veth|docker|br-/{print $2;exit}')
-    echo "$i"
+clear_ui() {
+  if [[ -t 1 ]]; then
+    printf '\033[H\033[2J'
+  fi
 }
 
-get_meminfo() {
-    MEM_TOTAL_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null)
-    SWAP_TOTAL_KB=$(awk '/SwapTotal/{print $2}' /proc/meminfo 2>/dev/null)
-    [ -z "$MEM_TOTAL_KB" ] && MEM_TOTAL_KB=2097152
-    [ -z "$SWAP_TOTAL_KB" ] && SWAP_TOTAL_KB=0
-    # Fix: 使用 MemAvailable 而非 MemTotal+Swap，避免高估可用内存
-    MEM_AVAIL_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null)
-    [ -z "$MEM_AVAIL_KB" ] && MEM_AVAIL_KB=$(( MEM_TOTAL_KB / 2 ))
+banner() {
+  clear_ui
+  printf '%sNetwork BBR Optimizer%s  %s%s%s\n' "$BOLD" "$RESET" "$CYAN" "$VERSION" "$RESET"
+  printf '目标: 极致满速 + 可控低抖动 | 默认不启用应用层 mux\n'
+  hr
 }
 
-# 检测 BBR 版本 (仅识别，不管理)
-# 写入: BBR_VER (bbr1/bbr3 字符串) BBR_VER_LABEL (含来源说明)
-detect_bbr_version() {
-    local kernel=$(uname -r)
-    local algos=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
-    BBR_VER="unknown"
-    BBR_VER_LABEL="未知"
-    if echo "$kernel" | grep -qiE 'xanmod'; then
-        BBR_VER="bbr3"; BBR_VER_LABEL="bbr3 (XanMod)"
-    elif modinfo tcp_bbr 2>/dev/null | grep -qiE '^version:.*[3-9]'; then
-        BBR_VER="bbr3"; BBR_VER_LABEL="bbr3"
-    elif echo "$algos" | grep -qw "bbr3"; then
-        BBR_VER="bbr3"; BBR_VER_LABEL="bbr3"
-    elif echo "$algos" | grep -qw "bbr2"; then
-        BBR_VER="bbr2"; BBR_VER_LABEL="bbr2"
-    elif echo "$algos" | grep -qw "bbr"; then
-        BBR_VER="bbr1"; BBR_VER_LABEL="bbr1 (Linux 主线)"
-    else
-        BBR_VER="none"; BBR_VER_LABEL="不支持 (内核 <4.9)"
-    fi
+yn_label() {
+  [[ "${1:-no}" == "yes" ]] && printf '是' || printf '否'
 }
 
-# ==================== 交互组件 ====================
-select_menu() {
-    local title="$1"; shift; local opts=("$@") cnt=${#opts[@]} sel=0
-    tput civis 2>/dev/null
-    _d() {
-        for ((i=0;i<cnt+4;i++)); do tput cuu1 2>/dev/null; tput el 2>/dev/null; done
-        echo ""; echo -e "  ${BOLD}${CYAN}$title${NC}"; echo -e "  ${DIM}上下键选择，回车确认${NC}"; echo ""
-        for ((i=0;i<cnt;i++)); do
-            [ $i -eq $sel ] && echo -e "  ${GREEN}>${NC} ${WHITE}${BOLD}${opts[$i]}${NC}" || echo -e "    ${DIM}${opts[$i]}${NC}"
-        done
-    }
-    for ((i=0;i<cnt+4;i++)); do echo ""; done; _d
-    while true; do
-        IFS= read -rsn1 k
-        case "$k" in
-            $'\x1b') read -rsn2 k; case "$k" in '[A') ((sel--)); [ $sel -lt 0 ] && sel=$((cnt-1));; '[B') ((sel++)); [ $sel -ge $cnt ] && sel=0;; esac; _d;;
-            '') rst; return $sel;;
-        esac
-    done
+role_label() {
+  case "${ROLE:-forwarding}" in
+    forwarding) printf '转发节点' ;;
+    landing) printf '落地节点' ;;
+    *) printf '%s' "$ROLE" ;;
+  esac
 }
 
-confirm_action() { rst; echo -ne "  ${YELLOW}$1 [y/N]: ${NC}"; read -r a; [[ "$a" =~ ^[Yy]$ ]]; }
-
-read_int() {
-    local prompt="$1" default="$2" varname="$3"; rst
-    while true; do
-        [ -n "$default" ] && echo -ne "  ${WHITE}${prompt} [默认${default}]: ${NC}" || echo -ne "  ${WHITE}${prompt}: ${NC}"
-        read val; [ -z "$val" ] && [ -n "$default" ] && val=$default
-        [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -gt 0 ] && { eval "$varname=$val"; return; }
-        echo -e "  ${RED}请输入有效的正整数${NC}"
-    done
+scene_label() {
+  case "${SCENE:-plain}" in
+    front) printf '前置入口' ;;
+    ix) printf 'IX 专线' ;;
+    relay) printf '线路中继' ;;
+    international) printf '国际互联' ;;
+    plain) printf '普通 nftables 转发' ;;
+    landing) printf '落地' ;;
+    *) printf '%s' "$SCENE" ;;
+  esac
 }
 
-# 手动输入延迟 (RTT)
-read_rtt_via_tcp() {
-    local label="$1" varname="$2" rtt_def="$3"; rst
-    echo ""
-    echo -e "  ${DIM}-- ${label} 延迟 --${NC}"
-    echo -e "  ${DIM}填 ping 命令显示的 time= 数字（即 RTT，单位 ms），无需任何换算${NC}"
-    local p
-    read_int "${label} 延迟 (ping 命令显示的数字, ms)" "$rtt_def" "p"
-    eval "$varname=$p"
-    echo -e "  ${DIM}-> 采用 ${p}ms 作为 RTT${NC}"
+target_label() {
+  case "${TARGET:-speed}" in
+    speed) printf '极致满速' ;;
+    throughput) printf '极致吞吐' ;;
+    *) printf '%s' "$TARGET" ;;
+  esac
 }
 
-# ==================== 多线路收集器 ====================
-collect_lines() {
-    local dir_name="$1" name_hint="$2" bw_def="$3" rtt_def="$4"
-    CL_COUNT=0; CL_HEADER=""; CL_MAX_BDP=0; CL_MAX_BW=0; CL_MAIN_BW=0; CL_MAIN_RTT=0
-    while true; do
-        CL_COUNT=$(( CL_COUNT + 1 ))
-        echo -e "  ${BOLD}${YELLOW}-- ${dir_name} 线路 #${CL_COUNT} --${NC}"; rst
-        local bw rtt
-        read_int "  带宽 (Mbps)" "$bw_def" "bw"
-        read_rtt_via_tcp "  ${dir_name}#${CL_COUNT}" "rtt" "$rtt_def"
-        local bdp=$(( bw * rtt * 125 ))
-        echo -e "  ${DIM}-> ${bw}Mbps x ${rtt}ms = $(( bdp / 1024 ))KB BDP${NC}"
-        [ $bdp -gt $CL_MAX_BDP ] && { CL_MAX_BDP=$bdp; CL_MAIN_BW=$bw; CL_MAIN_RTT=$rtt; }
-        [ $bw -gt $CL_MAX_BW ] && CL_MAX_BW=$bw
-        CL_HEADER="${CL_HEADER}
-# ${dir_name}#${CL_COUNT}: ${bw}Mbps | ${rtt}ms | BDP $(( bdp / 1024 ))KB"
-        echo ""; confirm_action "还有更多${dir_name}线路?" || break; echo ""
-    done
+business_label() {
+  case "${BUSINESS:-mixed}" in
+    mixed) printf '混合代理/中转' ;;
+    tcp) printf 'TCP 长连接' ;;
+    udp_game) printf 'UDP 游戏/实时' ;;
+    web) printf 'Web/HTTPS' ;;
+    *) printf '%s' "$BUSINESS" ;;
+  esac
 }
 
-# ==================== 内存评估 ====================
-check_memory_and_swap() {
-    echo ""; echo -e "  ${BOLD}${CYAN}[ 内存评估 ]${NC}"
-    get_meminfo
-    echo -e "  ${WHITE}物理内存: ${BOLD}$(( MEM_TOTAL_KB / 1024 ))MB${NC}"
-    [ $SWAP_TOTAL_KB -gt 0 ] && echo -e "  ${WHITE}Swap:     ${BOLD}$(( SWAP_TOTAL_KB / 1024 ))MB${NC}" || echo -e "  ${DIM}Swap:     未配置${NC}"
-    echo ""
-    if [ $(( MEM_AVAIL_KB / 1024 )) -lt 1024 ]; then
-        echo -e "  ${YELLOW}[!] 内存较小${NC}"
-        if confirm_action "创建2GB Swap?"; then
-            if [ ! -f /swapfile ]; then
-                fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
-                chmod 600 /swapfile; mkswap /swapfile >/dev/null 2>&1; swapon /swapfile >/dev/null 2>&1
-                grep -q /swapfile /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab
-                echo -e "  ${GREEN}[OK] Swap已创建${NC}"
-            else echo -e "  ${DIM}已存在${NC}"; fi
-        fi
-    else echo -e "  ${GREEN}[OK] 内存充足${NC}"; fi
+show_summary() {
+  printf '%s当前参数%s\n' "$BOLD" "$RESET"
+  printf '  角色/场景      : %s / %s\n' "$(role_label)" "$(scene_label)"
+  printf '  目标/业务      : %s / %s\n' "$(target_label)" "$(business_label)"
+  printf '  带宽 Mbps      : 上行 %s / 下行 %s\n' "$UP_MBPS" "$DOWN_MBPS"
+  printf '  RTT ms         : 上游 %s / 下游 %s\n' "$UP_RTT" "$DOWN_RTT"
+  printf '  丢包/抖动      : %s%% / %sms\n' "$LOSS_PCT" "$JITTER_MS"
+  printf '  网卡/队列      : %s / RX %s / TX %s / CPU %s\n' "$DEFAULT_IFACE" "$RX_QUEUES" "$TX_QUEUES" "$CPU_COUNT"
+  printf '  转发状态       : stateful=%s, landing_routes=%s, multipath=%s, ipv6_ra=%s\n' \
+    "$(yn_label "$STATEFUL")" "$(yn_label "$LANDING_ROUTES")" "$(yn_label "$MULTIPATH")" "$(yn_label "$IPV6_RA")"
+  printf '  握手优化       : TFO=%s, local_tcp=%s, global_tfo=%s, busy_poll=%s\n' \
+    "$(yn_label "$HANDSHAKE")" "$(yn_label "$LOCAL_TCP_TERMINATION")" "$(yn_label "$TFO_GLOBAL")" "$BUSY_MODE"
+  printf '  手动覆盖       : tcp_cap=%sMB, bdp_mult=%s, tcp=%s, udp=%s, cps=%s\n' \
+    "$MANUAL_TCP_CAP_MB" "$MANUAL_BDP_MULT" "$TCP_CONNS_OVERRIDE" "$UDP_SESSIONS_OVERRIDE" "$CPS_OVERRIDE"
+  [[ -n "$SERVICE_NAME" ]] && printf '  服务 nofile    : %s\n' "$SERVICE_NAME"
 }
 
-# ================================================================
-#              BDP动态计算与sysctl生成 (1Mbps~10Gbps)
-# ================================================================
-
-calculate_and_generate() {
-    local role_name="$1" up_bw="$2" up_rtt="$3" down_bw="$4" down_rtt="$5" extra_header="$6"
-    get_meminfo
-    detect_bbr_version   # 自动识别 BBR1/BBR3，影响下方 ECN 等参数
-
-    local bdp_up=$(( up_bw * up_rtt * 125 ))
-    local bdp_dn=$(( down_bw * down_rtt * 125 ))
-    local bdp=$bdp_up; [ $bdp_dn -gt $bdp ] && bdp=$bdp_dn
-    local mbw=$up_bw; [ $down_bw -gt $mbw ] && mbw=$down_bw
-
-    # BBR3 改进了拥塞响应算法，缓冲倍数可适度收敛 (BBR1=8x, BBR3=6x)
-    # 因为 BBR3 更精准探测带宽，不需要那么多 buffer 余量
-    local bdp_mult=8
-    [ "$BBR_VER" = "bbr3" ] && bdp_mult=6
-    local max=$(( (bdp * bdp_mult + 1048575) / 1048576 * 1048576 ))
-    [ $max -lt 16777216 ] && max=16777216
-    [ $max -gt 536870912 ] && max=536870912
-
-    # ECN: BBR1 关闭(老旧路由器兼容); BBR3 设 2=只被动接受(对端请求才用),
-    # 避免跨境多跳路径上主动协商(=1)踩到 ECN 黑洞导致连接变慢
-    local ecn_val=0
-    [ "$BBR_VER" = "bbr3" ] && ecn_val=2
-
-    # tcp_notsent_lowat: 应用最多堆 16KB-256KB 未发送数据在内核里，超过则 write() 阻塞
-    # 工业最佳实践 (Cloudflare/Google): 固定低范围而非跟带宽线性放大
-    # 防止高带宽下应用堆 MB 级数据增加应用层延迟
-    local lowat=$(clamp $(( mbw * 64 )) 16384 262144)
-
-    local udpr=$bdp
-    local udpr_b=$(( mbw * 8192 ))
-    [ $udpr_b -gt $udpr ] && udpr=$udpr_b
-    udpr=$(clamp $udpr 2097152 16777216)
-
-    # udp_mem 单位是“页”(4KB)。取可用内存的 40%，并夹在 [64MB, 物理内存的 50%]：
-    # 旧版固定 2GB 死下限在小内存机上会高于物理内存，使 UDP 内存压力永不触发 -> OOM 风险
-    local udp_max_pages=$(( MEM_AVAIL_KB / 4 * 40 / 100 ))
-    local udp_floor=16384
-    local udp_cap=$(( MEM_TOTAL_KB / 8 ))
-    [ $udp_max_pages -lt $udp_floor ] && udp_max_pages=$udp_floor
-    [ $udp_max_pages -gt $udp_cap ] && udp_max_pages=$udp_cap
-    local udpml=$(( udp_max_pages / 2 ))
-    local udpmm=$(( udp_max_pages * 3 / 4 ))
-    local udpmax=$udp_max_pages
-
-    local omem=$(clamp $(( mbw * 256 )) 262144 4194304)
-
-    local bp=0 br=0
-    if [ "$up_rtt" -le 10 ] && [ "$down_rtt" -le 10 ] 2>/dev/null; then
-        [ $mbw -ge 20 ] && { bp=$(clamp $(( mbw / 5 )) 20 200); br=$bp; }
-    fi
-
-    # initcwnd 按最大 RTT 自适应: 本地链路大窗口秒开, 跨境/高丢包链路收敛防突发重传雪崩
-    local maxrtt=$up_rtt; [ "$down_rtt" -gt "$maxrtt" ] 2>/dev/null && maxrtt=$down_rtt
-    local initcwnd=32
-    if   [ "$maxrtt" -le 10 ] 2>/dev/null; then initcwnd=128
-    elif [ "$maxrtt" -le 50 ] 2>/dev/null; then initcwnd=64
-    elif [ "$maxrtt" -le 120 ] 2>/dev/null; then initcwnd=32
-    else initcwnd=20; fi
-
-    cat << EOF
-# ============================================================
-# ${role_name} - 网络优化配置 (克制版，仅覆盖内核默认不合理项)
-${extra_header}
-# 内核 BBR 版本: ${BBR_VER_LABEL} -> 适配策略 BDPx${bdp_mult}, ECN=${ecn_val}
-# BDP: ${up_bw}Mx${up_rtt}ms=$(( bdp_up / 1024 ))KB / ${down_bw}Mx${down_rtt}ms=$(( bdp_dn / 1024 ))KB
-# 缓冲上限: ${max} bytes ($(( max / 1048576 ))MB) | 内存 $(( MEM_TOTAL_KB / 1024 ))MB
-# 生成: $VERSION $(date '+%Y-%m-%d %H:%M:%S')
-# ============================================================
-
-# --- 拥塞控制 ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# --- 缓冲区上限 ---
-net.core.rmem_max = $max
-net.core.wmem_max = $max
-net.ipv4.tcp_rmem = 4096 87380 $max
-net.ipv4.tcp_wmem = 4096 65536 $max
-net.core.optmem_max = $omem
-
-# --- 低延迟核心 ---
-net.ipv4.tcp_notsent_lowat = $lowat
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_autocorking = 0
-net.ipv4.tcp_min_rtt_wlen = 60
-
-# --- 跨国链路 ---
-net.ipv4.tcp_max_reordering = 1000
-# ECN: BBR1=0 关闭; BBR3=2 被动接受(主动协商易在跨境路径踩黑洞)
-net.ipv4.tcp_ecn = $ecn_val
-net.ipv4.tcp_mtu_probing = 1
-
-# --- 连接管理 ---
-net.ipv4.tcp_rfc1337 = 1
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_keepalive_time = 30
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 3
-net.ipv4.tcp_limit_output_bytes = 4194304
-
-# --- 连接队列 ---
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65536
-net.ipv4.ip_local_port_range = 1024 65535
-
-# --- 网卡调度 ---
-net.core.flow_limit_table_len = 8192
-$([ "$bp" -gt 0 ] && echo "# 低延迟机房启用 busy_poll (会增加CPU占用与功耗, 小核VPS慎用)
-net.core.busy_poll = $bp
-net.core.busy_read = $br")
-
-# --- UDP ---
-net.ipv4.udp_rmem_min = $udpr
-net.ipv4.udp_wmem_min = $udpr
-net.ipv4.udp_mem = $udpml $udpmm $udpmax
-
-# --- 转发 ---
-net.ipv4.ip_forward = 1
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-
-# --- 安全加固 ---
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
-
-# --- 内存 ---
-vm.swappiness = 1
-
-# --- initcwnd 标记 (apply_initcwnd 通过 grep 这一行提取数字，必须保留) ---
-# initcwnd=$initcwnd initrwnd=$initcwnd
-EOF
+edit_role_scene() {
+  banner
+  printf '%s角色与场景%s\n' "$BOLD" "$RESET"
+  ROLE=$(ask_choice "机器角色 forwarding=转发 landing=落地" "$ROLE" forwarding landing)
+  if [[ "$ROLE" == "forwarding" ]]; then
+    SCENE=$(ask_choice "转发场景 front/ix/relay/international/plain" "${SCENE:-plain}" front ix relay international plain)
+    STATEFUL=$(ask_yes_no "是否 NAT/TProxy/状态 nftables 规则" "$STATEFUL")
+    LANDING_ROUTES="no"
+    LOCAL_TCP_TERMINATION=$(ask_yes_no "这台转发机是否也终止 TCP，例如还有代理/Web listener" "$LOCAL_TCP_TERMINATION")
+  else
+    SCENE="landing"
+    LANDING_ROUTES=$(ask_yes_no "落地机是否同时做 NAT/路由" "$LANDING_ROUTES")
+    [[ "$LANDING_ROUTES" == "yes" ]] && STATEFUL="yes" || STATEFUL="no"
+    LOCAL_TCP_TERMINATION=$(ask_yes_no "落地机是否本机终止 TCP，例如 Xray/Web/代理 listener" "$LOCAL_TCP_TERMINATION")
+  fi
+  TARGET=$(ask_choice "优化目标 speed=极致满速 throughput=极致吞吐" "$TARGET" speed throughput)
+  BUSINESS=$(ask_choice "业务类型 mixed/tcp/udp_game/web" "$BUSINESS" mixed tcp udp_game web)
 }
 
-role_ix_sysctl_overrides() {
-    cat << 'EOF'
-
-# --- 角色增强: IX专线 / 高并发 UDP 中转 ---
-net.core.netdev_max_backlog = 65536
-net.netfilter.nf_conntrack_max = 2097152
-net.netfilter.nf_conntrack_tcp_timeout_established = 1200
-net.netfilter.nf_conntrack_udp_timeout = 60
-net.netfilter.nf_conntrack_udp_timeout_stream = 300
-net.ipv6.conf.all.forwarding = 1
-net.ipv6.conf.default.forwarding = 1
-net.ipv6.conf.all.accept_ra = 2
-net.ipv6.conf.default.accept_ra = 2
-EOF
+edit_link() {
+  banner
+  printf '%s链路参数%s\n' "$BOLD" "$RESET"
+  UP_MBPS=$(to_int "$(ask "上行/入口 Mbps" "$UP_MBPS")")
+  DOWN_MBPS=$(to_int "$(ask "下行/出口 Mbps" "$DOWN_MBPS")")
+  UP_RTT=$(to_int "$(ask "上游 RTT ms" "$UP_RTT")")
+  DOWN_RTT=$(to_int "$(ask "下游 RTT ms" "$DOWN_RTT")")
+  LOSS_PCT=$(ask "丢包率百分比，例如 0 或 0.3" "$LOSS_PCT")
+  JITTER_MS=$(to_int "$(ask "抖动 ms" "$JITTER_MS")")
+  MULTIPATH=$(ask_yes_no "是否多出口/策略路由/非对称回程" "$MULTIPATH")
+  IPV6_RA=$(ask_yes_no "IPv6 默认路由是否依赖 RA" "$IPV6_RA")
 }
 
-role_relay_small_sysctl_overrides() {
-    cat << 'EOF'
-
-# --- 角色增强: 转发线路 / AWS 小内存保守模式 ---
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 65536 33554432
-net.core.netdev_max_backlog = 8192
-net.netfilter.nf_conntrack_max = 1048576
-net.netfilter.nf_conntrack_tcp_timeout_established = 1200
-net.netfilter.nf_conntrack_udp_timeout = 60
-net.netfilter.nf_conntrack_udp_timeout_stream = 300
-net.ipv6.conf.all.forwarding = 1
-net.ipv6.conf.default.forwarding = 1
-net.ipv6.conf.all.accept_ra = 2
-net.ipv6.conf.default.accept_ra = 2
-EOF
+edit_runtime() {
+  banner
+  printf '%s网卡与运行时%s\n' "$BOLD" "$RESET"
+  CPU_COUNT=$(to_int "$(ask "CPU 核数" "$CPU_COUNT")")
+  DEFAULT_IFACE=$(ask "主网卡 interface" "$DEFAULT_IFACE")
+  RX_QUEUES=$(to_int "$(ask "RX 队列数" "$RX_QUEUES")")
+  TX_QUEUES=$(to_int "$(ask "TX 队列数" "$TX_QUEUES")")
+  BUSY_MODE=$(ask_choice "busy_poll 模式 auto/force/off" "$BUSY_MODE" auto force off)
 }
 
-# RPS 现代 systemd 优化
-apply_rps() {
-    local iface=$(detect_interface)
-    [ -z "$iface" ] && return
-    local qc=$(ls -d /sys/class/net/$iface/queues/rx-* 2>/dev/null | wc -l)
-    [ -z "$qc" ] && qc=1
-    local cc=$(nproc 2>/dev/null || echo 1)
-    [ "$qc" -ge "$cc" ] && return
-    [ "$cc" -lt 2 ] && return
+edit_handshake() {
+  banner
+  printf '%s握手与应用层选项%s\n' "$BOLD" "$RESET"
+  HANDSHAKE=$(ask_yes_no "是否启用 TFO 等建连优化" "$HANDSHAKE")
+  LOCAL_TCP_TERMINATION=$(ask_yes_no "本机是否终止 TCP" "$LOCAL_TCP_TERMINATION")
+  TFO_GLOBAL=$(ask_yes_no "是否启用全局 listener TFO 1024 bit" "$TFO_GLOBAL")
+  printf '\n应用层 mux/smux/yamux/multiplex 默认不启用，本脚本不会写 mux 配置。\n'
+  pause_ui
+}
 
-    echo ""
-    echo -e "  ${BOLD}${YELLOW}[ 多核负载均衡 (RPS) ]${NC}"
-    echo -e "  ${DIM}网卡 ${qc}队列 < CPU ${cc}核，自动开启 RPS 分散中断 (基于 Systemd)${NC}"
-    echo ""
+edit_capacity() {
+  banner
+  printf '%s容量与高级覆盖%s\n' "$BOLD" "$RESET"
+  TCP_CONNS_OVERRIDE=$(to_int "$(ask "TCP 并发覆盖，0=自动" "$TCP_CONNS_OVERRIDE")")
+  UDP_SESSIONS_OVERRIDE=$(to_int "$(ask "UDP 会话覆盖，0=自动" "$UDP_SESSIONS_OVERRIDE")")
+  CPS_OVERRIDE=$(to_int "$(ask "每秒新建连接覆盖，0=自动" "$CPS_OVERRIDE")")
+  MANUAL_TCP_CAP_MB=$(to_int "$(ask "单连接 tcp_max 上限 MB，0=自动" "$MANUAL_TCP_CAP_MB")")
+  MANUAL_BDP_MULT=$(to_int "$(ask "BDP 倍数覆盖，0=自动" "$MANUAL_BDP_MULT")")
+  BBR_KIND=$(ask_choice "BBR 版本假设 bbr1/bbr3/unknown" "$BBR_KIND" bbr1 bbr3 unknown)
+  SERVICE_NAME=$(ask "可选 systemd 服务名，用于 LimitNOFILE drop-in，空=跳过" "$SERVICE_NAME")
+}
 
-    local mask=$(printf '%x' $(( (1 << cc) - 1 )))
-    echo 65536 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null
+interactive_menu() {
+  local choice
+  while true; do
+    banner
+    show_summary
+    hr
+    printf '  1) 角色/场景/业务\n'
+    printf '  2) 链路带宽/RTT/丢包抖动\n'
+    printf '  3) 网卡/RPS/busy_poll\n'
+    printf '  4) TFO/握手优化/应用层说明\n'
+    printf '  5) 并发容量/高级覆盖\n'
+    printf '  6) 生成配置\n'
+    printf '  7) 退出\n'
+    read -r -p "请选择 [6]: " choice || true
+    choice="${choice:-6}"
+    case "$choice" in
+      1) edit_role_scene ;;
+      2) edit_link ;;
+      3) edit_runtime ;;
+      4) edit_handshake ;;
+      5) edit_capacity ;;
+      6) break ;;
+      7|q|Q) exit 0 ;;
+      *) warn "无效选择"; pause_ui ;;
+    esac
+  done
+}
 
-    cat > /usr/local/bin/enforce-rps.sh << EOF
-#!/bin/bash
-echo 65536 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null
-for i in \$(seq 0 $(( qc - 1 ))); do
-    rx="/sys/class/net/${iface}/queues/rx-\$i"
-    if [ -d "\$rx" ]; then
-        echo "${mask}" > "\$rx/rps_cpus" 2>/dev/null
-        echo 4096 > "\$rx/rps_flow_cnt" 2>/dev/null
-    fi
+linear_wizard() {
+  ROLE=$(ask_choice "Role: forwarding or landing" "$ROLE" forwarding landing)
+  if [[ "$ROLE" == "forwarding" ]]; then
+    SCENE=$(ask_choice "Forwarding scene: front, ix, relay, international, plain" "$SCENE" front ix relay international plain)
+    STATEFUL=$(ask_yes_no "Does this node use NAT/TProxy/stateful nftables rules?" "$STATEFUL")
+    LANDING_ROUTES="no"
+  else
+    SCENE="landing"
+    LANDING_ROUTES=$(ask_yes_no "Does this landing node also do NAT/routing?" "$LANDING_ROUTES")
+    [[ "$LANDING_ROUTES" == "yes" ]] && STATEFUL="yes" || STATEFUL="no"
+  fi
+
+  TARGET=$(ask_choice "Target: speed or throughput" "$TARGET" speed throughput)
+  BUSINESS=$(ask_choice "Business: mixed, tcp, udp_game, web" "$BUSINESS" mixed tcp udp_game web)
+
+  UP_MBPS=$(to_int "$(ask "Upstream/upload Mbps" "$UP_MBPS")")
+  DOWN_MBPS=$(to_int "$(ask "Downstream/download Mbps" "$DOWN_MBPS")")
+  UP_RTT=$(to_int "$(ask "Upstream RTT ms" "$UP_RTT")")
+  DOWN_RTT=$(to_int "$(ask "Downstream RTT ms" "$DOWN_RTT")")
+  LOSS_PCT=$(ask "Loss percent, e.g. 0 or 0.3" "$LOSS_PCT")
+  JITTER_MS=$(to_int "$(ask "Jitter ms" "$JITTER_MS")")
+
+  CPU_COUNT=$(to_int "$(ask "CPU cores" "$CPU_COUNT")")
+  DEFAULT_IFACE=$(ask "Primary interface for txqueuelen/RPS" "$DEFAULT_IFACE")
+  RX_QUEUES=$(to_int "$(ask "RX queue count" "$RX_QUEUES")")
+  TX_QUEUES=$(to_int "$(ask "TX queue count" "$TX_QUEUES")")
+
+  MULTIPATH=$(ask_yes_no "Multi-path, policy routing, or asymmetric return?" "$MULTIPATH")
+  IPV6_RA=$(ask_yes_no "Does IPv6 default route depend on RA on this interface?" "$IPV6_RA")
+  HANDSHAKE=$(ask_yes_no "Enable handshake optimizations where applicable, e.g. TFO?" "$HANDSHAKE")
+  if [[ "$ROLE" == "landing" ]]; then
+    LOCAL_TCP_TERMINATION=$(ask_yes_no "Does this node terminate TCP locally, e.g. Xray/Web/proxy listener?" "$LOCAL_TCP_TERMINATION")
+  else
+    LOCAL_TCP_TERMINATION=$(ask_yes_no "Does this forwarding node also terminate TCP locally?" "$LOCAL_TCP_TERMINATION")
+  fi
+  TFO_GLOBAL=$(ask_yes_no "Enable global listener TFO 1024 bit? Usually no" "$TFO_GLOBAL")
+  BUSY_MODE=$(ask_choice "busy_poll mode: auto, force, off" "$BUSY_MODE" auto force off)
+  MANUAL_TCP_CAP_MB=$(to_int "$(ask "Manual tcp_max cap MB, 0 = auto" "$MANUAL_TCP_CAP_MB")")
+  MANUAL_BDP_MULT=$(to_int "$(ask "Manual BDP multiplier, 0 = auto" "$MANUAL_BDP_MULT")")
+  BBR_KIND=$(ask_choice "BBR version assumption: bbr1, bbr3, unknown" "$BBR_KIND" bbr1 bbr3 unknown)
+  TCP_CONNS_OVERRIDE=$(to_int "$(ask "TCP concurrent connections, 0 = auto" "$TCP_CONNS_OVERRIDE")")
+  UDP_SESSIONS_OVERRIDE=$(to_int "$(ask "UDP sessions, 0 = auto" "$UDP_SESSIONS_OVERRIDE")")
+  CPS_OVERRIDE=$(to_int "$(ask "New connections per second, 0 = auto" "$CPS_OVERRIDE")")
+  SERVICE_NAME=$(ask "Optional service name for LimitNOFILE drop-in, empty = skip" "$SERVICE_NAME")
+}
+
+usage() {
+  cat <<'USAGE'
+Network BBR Optimizer bbr.sh
+
+交互式 Linux 网络优化脚本，面向极致专用转发节点和落地节点。
+
+用法:
+  bash bbr.sh             # 菜单式交互界面，先生成配置，再确认是否应用
+  bash bbr.sh --quick     # 线性问答模式
+  bash bbr.sh --dry-run   # 只生成配置文件，不应用
+  bash bbr.sh --apply     # 生成后默认询问应用
+  bash bbr.sh --help
+
+默认不启用应用层 mux/multiplex。
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --quick) UI_MODE="wizard" ;;
+    --dry-run) APPLY_MODE="no" ;;
+    --apply) APPLY_MODE="yes" ;;
+    --help|-h) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+  shift
 done
+
+is_linux() { [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]]; }
+
+need_linux() {
+  is_linux || die "This script is intended to run on Linux."
+}
+
+is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
+
+ask() {
+  local prompt="$1" default="$2" value
+  read -r -p "$prompt [$default]: " value || true
+  printf '%s' "${value:-$default}"
+}
+
+ask_yes_no() {
+  local prompt="$1" default="$2" value
+  while true; do
+    read -r -p "$prompt [$default]: " value || true
+    value="${value:-$default}"
+    case "$value" in
+      y|Y|yes|YES|Yes) printf 'yes'; return ;;
+      n|N|no|NO|No) printf 'no'; return ;;
+      *) printf 'Please answer yes or no.\n' >&2 ;;
+    esac
+  done
+}
+
+ask_choice() {
+  local prompt="$1" default="$2" value valid
+  shift 2
+  while true; do
+    read -r -p "$prompt [$default]: " value || true
+    value="${value:-$default}"
+    for valid in "$@"; do
+      if [[ "$value" == "$valid" ]]; then
+        printf '%s' "$value"
+        return
+      fi
+    done
+    printf 'Valid choices: %s\n' "$*" >&2
+  done
+}
+
+to_int() {
+  awk -v n="${1:-0}" 'BEGIN { if (n < 0) n = 0; printf "%.0f", n }'
+}
+
+loss_to_bp() {
+  awk -v n="${1:-0}" 'BEGIN { if (n < 0) n = 0; printf "%.0f", n * 100 }'
+}
+
+min() { (( $1 < $2 )) && printf '%s' "$1" || printf '%s' "$2"; }
+max() { (( $1 > $2 )) && printf '%s' "$1" || printf '%s' "$2"; }
+
+clamp() {
+  local n="$1" lo="$2" hi="$3"
+  if (( n < lo )); then
+    printf '%s' "$lo"
+  elif (( n > hi )); then
+    printf '%s' "$hi"
+  else
+    printf '%s' "$n"
+  fi
+}
+
+ceil_div() {
+  local n="$1" d="$2"
+  (( d > 0 )) || d=1
+  printf '%s' $(((n + d - 1) / d))
+}
+
+pow2ceil() {
+  local n="$1" p=1
+  (( n < 1 )) && n=1
+  while (( p < n )); do
+    p=$((p << 1))
+  done
+  printf '%s' "$p"
+}
+
+round_up_mib() {
+  local n="$1"
+  printf '%s' $(( ((n + MIB - 1) / MIB) * MIB ))
+}
+
+sysctl_exists() {
+  local key="$1" path
+  path="/proc/sys/${key//./\/}"
+  [[ -e "$path" ]]
+}
+
+read_sysctl() {
+  local key="$1" fallback="$2"
+  sysctl -n "$key" 2>/dev/null || printf '%s\n' "$fallback"
+}
+
+mem_kb() {
+  awk -v key="$1" '$1 == key ":" { print $2; found=1 } END { if (!found) print 0 }' /proc/meminfo
+}
+
+detect_default_iface() {
+  ip route show default 2>/dev/null | awk '{
+    for (i=1; i<=NF; i++) if ($i == "dev") { print $(i+1); exit }
+  }'
+}
+
+count_queues() {
+  local iface="$1" type="$2" dir count
+  dir="/sys/class/net/$iface/queues"
+  if [[ -d "$dir" ]]; then
+    count=$(find "$dir" -maxdepth 1 -type d -name "${type}-*" 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$count" =~ ^[0-9]+$ ]] && (( count > 0 )) && printf '%s' "$count" && return
+  fi
+  printf '1'
+}
+
+cpu_count() {
+  nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || printf '1'
+}
+
+cpumask_all() {
+  local cpus="$1" full rem i lower=() upper
+  (( cpus < 1 )) && cpus=1
+  full=$((cpus / 32))
+  rem=$((cpus % 32))
+  for ((i=0; i<full; i++)); do
+    lower+=("ffffffff")
+  done
+  if (( rem > 0 )); then
+    upper=$(printf '%x' $(((1 << rem) - 1)))
+    lower+=("$upper")
+  fi
+  for ((i=${#lower[@]}-1; i>=0; i--)); do
+    if (( i != ${#lower[@]}-1 )); then printf ','; fi
+    printf '%s' "${lower[$i]}"
+  done
+}
+
+emit_sysctl() {
+  local key="$1" value="$2"
+  if sysctl_exists "$key"; then
+    printf '%s = %s\n' "$key" "$value" >> "$SYSCTL_OUT"
+  else
+    printf '# skipped missing: %s = %s\n' "$key" "$value" >> "$SYSCTL_OUT"
+  fi
+}
+
+backup_file() {
+  local file="$1" backup_dir="$2"
+  if [[ -e "$file" ]]; then
+    mkdir -p "$backup_dir$(dirname "$file")"
+    cp -a "$file" "$backup_dir$file"
+  fi
+}
+
+install_file() {
+  local src="$1" dst="$2" mode="$3" backup_dir="$4"
+  backup_file "$dst" "$backup_dir"
+  install -D -m "$mode" "$src" "$dst"
+}
+
+write_rollback() {
+  local rollback="$OUT_DIR/rollback.sh" backup_dir="$1"
+  cat > "$rollback" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+BACKUP_DIR="$backup_dir"
+restore_or_remove() {
+  local path="\$1"
+  if [[ -e "\$BACKUP_DIR\$path" ]]; then
+    install -D -m 0644 "\$BACKUP_DIR\$path" "\$path"
+  else
+    rm -f "\$path"
+  fi
+}
+restore_or_remove /etc/sysctl.d/99-network-optimize.conf
+restore_or_remove /etc/security/limits.d/99-network-optimize.conf
+restore_or_remove /etc/systemd/system.conf.d/99-network-optimize.conf
+restore_or_remove /etc/modprobe.d/nf_conntrack.conf
+restore_or_remove /usr/local/sbin/network-optimize-route.sh
+restore_or_remove /usr/local/sbin/network-optimize-nic.sh
+restore_or_remove /etc/systemd/system/network-optimize-route.service
+restore_or_remove /etc/systemd/system/network-optimize-nic.service
+systemctl daemon-reexec 2>/dev/null || true
+systemctl daemon-reload 2>/dev/null || true
+sysctl --system
+echo "Rollback files restored. Reboot may be needed for conntrack hashsize and route/NIC runtime state."
 EOF
-    chmod +x /usr/local/bin/enforce-rps.sh
-    cat > /etc/systemd/system/rps-optimize.service << 'EOF'
-[Unit]
-Description=RPS Multi-core Optimization
-After=network-online.target
+  chmod +x "$rollback"
+}
+
+need_linux
+
+TS="$(date +%Y%m%d-%H%M%S)"
+OUT_DIR="${OUT_DIR:-$PWD/bbr-output-$TS}"
+mkdir -p "$OUT_DIR"
+SYSCTL_OUT="$OUT_DIR/99-network-optimize.conf"
+LIMITS_OUT="$OUT_DIR/99-network-optimize-limits.conf"
+SYSTEMD_OUT="$OUT_DIR/99-network-optimize-system.conf"
+MODPROBE_OUT="$OUT_DIR/nf_conntrack.conf"
+ROUTE_OUT="$OUT_DIR/network-optimize-route.sh"
+NIC_OUT="$OUT_DIR/network-optimize-nic.sh"
+REPORT_OUT="$OUT_DIR/report.txt"
+
+printf 'Network BBR Optimizer bbr.sh %s\n' "$VERSION"
+printf 'Output directory: %s\n\n' "$OUT_DIR"
+
+MEM_TOTAL_KB=$(mem_kb MemTotal)
+MEM_AVAIL_KB=$(mem_kb MemAvailable)
+if (( MEM_AVAIL_KB <= 0 )); then MEM_AVAIL_KB="$MEM_TOTAL_KB"; fi
+CPU_COUNT=$(cpu_count)
+DEFAULT_IFACE=$(detect_default_iface)
+DEFAULT_IFACE="${DEFAULT_IFACE:-eth0}"
+RX_QUEUES=$(count_queues "$DEFAULT_IFACE" rx)
+TX_QUEUES=$(count_queues "$DEFAULT_IFACE" tx)
+
+ROLE="forwarding"
+SCENE="plain"
+TARGET="speed"
+BUSINESS="mixed"
+STATEFUL="yes"
+LANDING_ROUTES="no"
+IPV6_RA="no"
+MULTIPATH="yes"
+HANDSHAKE="yes"
+TFO_GLOBAL="no"
+LOCAL_TCP_TERMINATION="no"
+BUSY_MODE="auto"
+UP_MBPS=1000
+DOWN_MBPS=1000
+UP_RTT=80
+DOWN_RTT=80
+LOSS_PCT=0
+JITTER_MS=0
+MANUAL_TCP_CAP_MB=0
+MANUAL_BDP_MULT=0
+BBR_KIND="unknown"
+TCP_CONNS_OVERRIDE=0
+UDP_SESSIONS_OVERRIDE=0
+CPS_OVERRIDE=0
+SERVICE_NAME=""
+
+if [[ "$UI_MODE" == "menu" && -t 0 ]]; then
+  interactive_menu
+else
+  linear_wizard
+fi
+
+LOSS_BP=$(loss_to_bp "$LOSS_PCT")
+
+TCP_CONNS=350000
+UDP_SESSIONS=150000
+CPS=6000
+MEM_PCT=64
+if [[ "$ROLE" == "landing" ]]; then
+  TCP_CONNS=260000
+  UDP_SESSIONS=80000
+  CPS=4500
+fi
+
+if (( MEM_TOTAL_KB < 1024 * 1024 )); then
+  TCP_CONNS=$((TCP_CONNS / 4))
+  UDP_SESSIONS=$((UDP_SESSIONS / 4))
+  MEM_PCT=25
+elif (( MEM_TOTAL_KB < 2048 * 1024 )); then
+  TCP_CONNS=$((TCP_CONNS / 2))
+  UDP_SESSIONS=$((UDP_SESSIONS / 2))
+  MEM_PCT=40
+fi
+
+case "$BUSINESS" in
+  udp_game)
+    UDP_SESSIONS=$((UDP_SESSIONS * 2))
+    CPS=$((CPS * 3 / 2))
+    ;;
+  web)
+    UDP_SESSIONS=$((UDP_SESSIONS / 2))
+    CPS=$((CPS * 2))
+    ;;
+esac
+
+if [[ "$ROLE" == "forwarding" ]]; then
+  case "$SCENE" in
+    front)
+      TCP_CONNS=$((TCP_CONNS * 11 / 10))
+      CPS=$((CPS * 14 / 10))
+      ;;
+    ix)
+      TCP_CONNS=$((TCP_CONNS * 18 / 10))
+      UDP_SESSIONS=$((UDP_SESSIONS * 2))
+      CPS=$((CPS * 18 / 10))
+      MEM_PCT=$((MEM_PCT + 12))
+      ;;
+    relay)
+      TCP_CONNS=$((TCP_CONNS * 12 / 10))
+      MEM_PCT=$((MEM_PCT + 6))
+      ;;
+    international)
+      TCP_CONNS=$((TCP_CONNS * 11 / 10))
+      UDP_SESSIONS=$((UDP_SESSIONS * 12 / 10))
+      MEM_PCT=$((MEM_PCT + 4))
+      ;;
+  esac
+fi
+
+MEM_PCT=$((MEM_PCT + 14))
+MEM_PCT=$(clamp "$MEM_PCT" 35 78)
+if (( MEM_TOTAL_KB < 1024 * 1024 )); then
+  MEM_PCT=$(clamp "$MEM_PCT" 1 25)
+elif (( MEM_TOTAL_KB < 2048 * 1024 )); then
+  MEM_PCT=$(clamp "$MEM_PCT" 1 40)
+fi
+
+if (( TCP_CONNS_OVERRIDE > 0 )); then TCP_CONNS="$TCP_CONNS_OVERRIDE"; fi
+if (( UDP_SESSIONS_OVERRIDE > 0 )); then UDP_SESSIONS="$UDP_SESSIONS_OVERRIDE"; fi
+if (( CPS_OVERRIDE > 0 )); then CPS="$CPS_OVERRIDE"; fi
+
+UP_BDP=$((UP_MBPS * UP_RTT * 125))
+DOWN_BDP=$((DOWN_MBPS * DOWN_RTT * 125))
+BDP=$(max "$UP_BDP" "$DOWN_BDP")
+MBW=$(max "$UP_MBPS" "$DOWN_MBPS")
+MAXRTT=$(max "$UP_RTT" "$DOWN_RTT")
+
+if [[ "$BBR_KIND" == "bbr3" ]]; then
+  BDP_MULT=8
+else
+  BDP_MULT=10
+fi
+BDP_MULT=$((BDP_MULT + 2))
+[[ "$BUSINESS" == "udp_game" ]] && BDP_MULT=$((BDP_MULT + 1))
+(( LOSS_BP >= 100 )) && BDP_MULT=$((BDP_MULT + 1))
+(( LOSS_BP >= 300 )) && BDP_MULT=$((BDP_MULT + 1))
+JITTER_GUARD="no"
+if (( JITTER_MS > MAXRTT / 2 + 1 )); then
+  BDP_MULT=$((BDP_MULT + 1))
+  JITTER_GUARD="yes"
+fi
+if [[ "$SCENE" == "ix" ]] && (( LOSS_BP < 100 )); then
+  BDP_MULT=$((BDP_MULT + 2))
+fi
+if [[ "$SCENE" == "international" ]] && { (( LOSS_BP >= 100 )) || [[ "$JITTER_GUARD" == "yes" ]]; }; then
+  BDP_MULT=$(min "$BDP_MULT" 12)
+fi
+if (( MANUAL_BDP_MULT > 0 )); then
+  BDP_MULT="$MANUAL_BDP_MULT"
+fi
+BDP_MULT=$(clamp "$BDP_MULT" 2 16)
+if (( LOSS_BP >= 100 )) || [[ "$JITTER_GUARD" == "yes" ]] || [[ "$BUSINESS" == "udp_game" ]]; then
+  QUEUE_JITTER_GUARD="yes"
+  BDP_MULT=$(min "$BDP_MULT" 12)
+  NETDEV_BACKLOG_CAP=524288
+  TXQUEUELEN_CAP=12000
+  NETDEV_BUDGET_USECS_CAP=10000
+else
+  QUEUE_JITTER_GUARD="no"
+  NETDEV_BACKLOG_CAP=1048576
+  TXQUEUELEN_CAP=20000
+  NETDEV_BUDGET_USECS_CAP=12000
+fi
+
+ACTIVE_DIV_RAW=$((TCP_CONNS / 5000 + UDP_SESSIONS / 25000 + 4))
+ACTIVE_DIV_CAP=128
+if [[ "$SCENE" == "ix" ]]; then
+  ACTIVE_DIV_RAW=$((TCP_CONNS / 6000 + UDP_SESSIONS / 30000 + 4))
+  ACTIVE_DIV_CAP=96
+fi
+ACTIVE_DIV=$(clamp "$ACTIVE_DIV_RAW" 4 "$ACTIVE_DIV_CAP")
+MEM_AVAIL_BYTES=$((MEM_AVAIL_KB * 1024))
+MEM_TOTAL_BYTES=$((MEM_TOTAL_KB * 1024))
+MEM_CAP=$((MEM_AVAIL_BYTES * MEM_PCT / 100 / ACTIVE_DIV))
+if (( MANUAL_TCP_CAP_MB > 0 )); then
+  HARD_CAP=$((MANUAL_TCP_CAP_MB * MIB))
+else
+  HARD_CAP=$(min "$AUTO_TCP_CAP" "$MEM_CAP")
+fi
+HARD_CAP=$(max "$HARD_CAP" $((8 * MIB)))
+DESIRED=$((BDP * BDP_MULT))
+TCP_MAX=$(round_up_mib "$DESIRED")
+TCP_MAX=$(max "$TCP_MAX" $((16 * MIB)))
+TCP_MAX=$(min "$TCP_MAX" "$HARD_CAP")
+TCP_MAX=$(max "$TCP_MAX" $((8 * MIB)))
+
+read -r TCP_RMEM_MIN TCP_RMEM_DEFAULT _ <<< "$(read_sysctl net.ipv4.tcp_rmem '4096 87380 6291456')"
+read -r TCP_WMEM_MIN TCP_WMEM_DEFAULT _ <<< "$(read_sysctl net.ipv4.tcp_wmem '4096 65536 4194304')"
+
+ECN=0
+[[ "$BBR_KIND" == "bbr3" ]] && ECN=2
+
+TFO_VALUE=""
+TFO_BLACKHOLE=""
+if [[ "$HANDSHAKE" == "yes" ]]; then
+  if [[ "$LOCAL_TCP_TERMINATION" == "yes" ]]; then
+    TFO_VALUE=3
+  else
+    TFO_VALUE=""
+  fi
+  if [[ "$TFO_GLOBAL" == "yes" && -n "$TFO_VALUE" ]]; then
+    TFO_VALUE=$((TFO_VALUE | 1024))
+  fi
+  if [[ -n "$TFO_VALUE" ]]; then
+    if [[ "$SCENE" == "ix" && "$LOSS_BP" -lt 50 && "$QUEUE_JITTER_GUARD" == "no" ]]; then
+      TFO_BLACKHOLE=0
+    else
+      TFO_BLACKHOLE=60
+    fi
+  fi
+fi
+
+if [[ "$TARGET" == "throughput" ]]; then
+  LOWAT_FACTOR=384
+  LOWAT_LO=$((128 * 1024))
+  LOWAT_HI=$((2 * MIB))
+else
+  LOWAT_FACTOR=256
+  LOWAT_LO=$((64 * 1024))
+  LOWAT_HI=$((1 * MIB))
+fi
+LOWAT=$(clamp $((MBW * LOWAT_FACTOR)) "$LOWAT_LO" "$LOWAT_HI")
+
+UDP_FACTOR=8192
+[[ "$TARGET" == "throughput" ]] && UDP_FACTOR=12288
+[[ "$BUSINESS" == "udp_game" ]] && UDP_FACTOR=16384
+UDPR="$BDP"
+[[ "$BUSINESS" == "udp_game" ]] && UDPR=$((BDP * 2))
+UDPR=$(max "$UDPR" $((MBW * UDP_FACTOR)))
+if [[ "$BUSINESS" == "udp_game" ]]; then
+  UDP_SOCKET_CAP="$TCP_MAX"
+else
+  UDP_SOCKET_CAP=$((TCP_MAX / 2))
+fi
+UDP_SOCKET_CAP=$(max "$UDP_SOCKET_CAP" "$MIB")
+UDPR=$(clamp "$UDPR" "$MIB" "$UDP_SOCKET_CAP")
+UDP_MIN=4096
+[[ "$BUSINESS" == "udp_game" ]] && UDP_MIN=16384
+if [[ "$TARGET" == "throughput" || "$UDP_SESSIONS" -gt 50000 ]]; then UDP_MIN=8192; fi
+UDP_MIN=$(clamp "$UDP_MIN" 4096 65536)
+UDP_MAX_PAGES=$((MEM_AVAIL_KB / 4 * MEM_PCT / 100))
+UDP_FLOOR=$(max $(( ($(ceil_div "$UDPR" 4096)) * 4 )) 4096)
+UDP_CAP=$(max $((MEM_TOTAL_KB / 4 * MEM_PCT / 100)) "$UDP_FLOOR")
+UDP_MAX_PAGES=$(clamp "$UDP_MAX_PAGES" "$UDP_FLOOR" "$UDP_CAP")
+UDP_LOW=$((UDP_MAX_PAGES / 2))
+UDP_PRESSURE=$((UDP_MAX_PAGES * 3 / 4))
+
+OMEM_CAP=$(clamp $((TCP_MAX / 8)) "$MIB" $((16 * MIB)))
+OPTMEM=$(clamp $((MBW * 256 + UDP_SESSIONS / 4)) $((256 * 1024)) "$OMEM_CAP")
+
+if [[ "$BUSY_MODE" == "force" ]] || { [[ "$BUSY_MODE" == "auto" ]] && (( MBW >= 20 )) && { (( MAXRTT <= 20 )) || [[ "$BUSINESS" == "udp_game" && "$MAXRTT" -le 10 ]]; }; }; then
+  BUSY_POLL=$(clamp $((20 + MBW / (CPU_COUNT + 1))) 20 400)
+else
+  BUSY_POLL=""
+fi
+
+if (( MAXRTT <= 10 )); then
+  INITCWND=512
+elif (( MAXRTT <= 50 )); then
+  INITCWND=384
+elif (( MAXRTT <= 120 )); then
+  INITCWND=256
+else
+  INITCWND=160
+fi
+INITCWND=$(clamp "$INITCWND" 32 512)
+
+MIN_RTT_WLEN=120
+[[ "$TARGET" == "throughput" ]] && MIN_RTT_WLEN=180
+MIN_RTT_WLEN=$((MIN_RTT_WLEN + (JITTER_MS + 9) / 10))
+MIN_RTT_WLEN=$(clamp "$MIN_RTT_WLEN" 20 300)
+
+REORDERING=$((128 + MAXRTT * 2 + JITTER_MS * 8 + LOSS_BP))
+if [[ "$TARGET" == "throughput" ]]; then
+  REORDERING=$((REORDERING * 13 / 10))
+else
+  REORDERING=$((REORDERING * 12 / 10))
+fi
+REORDERING=$(clamp "$REORDERING" 128 2000)
+
+KEEP_TIME=30
+KEEP_INTVL=10
+KEEP_PROBES=3
+if [[ "$BUSINESS" == "web" ]]; then
+  KEEP_TIME=120
+  KEEP_INTVL=20
+  KEEP_PROBES=5
+elif (( TCP_CONNS > 200000 )); then
+  KEEP_TIME=45
+  KEEP_INTVL=15
+  KEEP_PROBES=4
+fi
+
+TCP_LIMIT_FACTOR=6
+[[ "$TARGET" == "throughput" ]] && TCP_LIMIT_FACTOR=8
+if [[ "$SCENE" == "ix" && "$LOSS_BP" -lt 50 ]]; then TCP_LIMIT_FACTOR=8; fi
+if [[ "$SCENE" == "international" ]]; then TCP_LIMIT_FACTOR=5; fi
+if (( LOSS_BP >= 100 )) || [[ "$QUEUE_JITTER_GUARD" == "yes" ]]; then TCP_LIMIT_FACTOR=4; fi
+if [[ "$BUSINESS" == "udp_game" ]]; then TCP_LIMIT_FACTOR=3; fi
+LIMIT_UPPER=$(clamp $((TCP_MAX / 2)) $((4 * MIB)) $((64 * MIB)))
+TCP_LIMIT=$(clamp $((BDP * TCP_LIMIT_FACTOR)) "$MIB" "$LIMIT_UPPER")
+
+SOMAXCONN=$(pow2ceil "$(clamp $((CPS * 4 + TCP_CONNS / 16)) 4096 1048576)")
+SYN_BACKLOG=$(pow2ceil "$(clamp $((CPS * 8 + TCP_CONNS / 8)) 8192 1048576)")
+FLOW_LIMIT=$(pow2ceil "$(clamp $((TCP_CONNS / 16 + UDP_SESSIONS / 8 + CPS * 2)) 4096 1048576)")
+NOFILE=$(pow2ceil "$(clamp $(((TCP_CONNS + UDP_SESSIONS + CPS * 10) * 2 + 4096)) 65536 8388608)")
+FS_FILE_MAX=$(pow2ceil "$(clamp $((NOFILE * 2)) 1048576 16777216)")
+
+NETDEV_RAW=$((MBW * 16 + CPS * 8 + UDP_SESSIONS / 8))
+NETDEV_RAW=$((NETDEV_RAW * 15 / 10))
+[[ "$SCENE" == "ix" ]] && NETDEV_RAW=$((NETDEV_RAW * 2))
+[[ "$TARGET" == "throughput" ]] && NETDEV_RAW=$((NETDEV_RAW * 15 / 10))
+[[ "$BUSINESS" == "udp_game" ]] && NETDEV_RAW=$((NETDEV_RAW + UDP_SESSIONS / 3))
+NETDEV_BACKLOG=$(pow2ceil "$(clamp "$NETDEV_RAW" 4096 "$NETDEV_BACKLOG_CAP")")
+
+CT_NEEDED="no"
+if [[ "$ROLE" == "forwarding" && "$STATEFUL" == "yes" ]]; then CT_NEEDED="yes"; fi
+if [[ "$ROLE" == "landing" && "$LANDING_ROUTES" == "yes" ]]; then CT_NEEDED="yes"; fi
+CT_RAW=$((TCP_CONNS + UDP_SESSIONS * 2 + CPS * 90))
+[[ "$SCENE" == "ix" ]] && CT_RAW=$((CT_RAW * 15 / 10))
+[[ "$TARGET" == "throughput" ]] && CT_RAW=$((CT_RAW * 125 / 100))
+[[ "$BUSINESS" == "udp_game" ]] && CT_RAW=$((CT_RAW + UDP_SESSIONS))
+CT_MEM_CAP=$((MEM_TOTAL_BYTES * MEM_PCT / 100 / 512))
+CT_UPPER=$(min 16777216 "$(max 131072 "$CT_MEM_CAP")")
+NF_CONNTRACK_MAX=$(clamp "$(pow2ceil "$CT_RAW")" 131072 "$CT_UPPER")
+NF_CONNTRACK_BUCKETS=$(pow2ceil "$(clamp "$NF_CONNTRACK_MAX" 32768 16777216)")
+
+CT_TCP_EST=900
+[[ "$BUSINESS" == "web" ]] && CT_TCP_EST=1200
+(( TCP_CONNS > 500000 )) && CT_TCP_EST=600
+CT_UDP=45
+[[ "$BUSINESS" == "udp_game" ]] && CT_UDP=30
+CT_UDP_STREAM=180
+
+TXQUEUELEN=$((MBW / 2 + MAXRTT * 10 + UDP_SESSIONS / 1000))
+TXQUEUELEN=$((TXQUEUELEN * 15 / 10))
+[[ "$TARGET" == "throughput" ]] && TXQUEUELEN=$((TXQUEUELEN * 13 / 10))
+[[ "$BUSINESS" == "udp_game" ]] && TXQUEUELEN=$((TXQUEUELEN + 500))
+TXQUEUELEN=$(clamp "$TXQUEUELEN" 500 "$TXQUEUELEN_CAP")
+
+RX_QUEUES=$(max "$RX_QUEUES" 1)
+NETDEV_BUDGET=$(clamp $((RX_QUEUES * 800)) 1600 20000)
+NETDEV_BUDGET_USECS=$(clamp 10000 1 "$NETDEV_BUDGET_USECS_CAP")
+[[ "$TARGET" == "throughput" ]] && NETDEV_BUDGET_USECS=$(clamp 12000 1 "$NETDEV_BUDGET_USECS_CAP")
+
+RPS_ENABLE="no"
+if (( RX_QUEUES < CPU_COUNT && CPU_COUNT >= 2 )); then
+  RPS_ENABLE="yes"
+fi
+RPS_ENTRIES=$(clamp "$FLOW_LIMIT" 32768 2097152)
+RPS_FLOW_CNT=$(clamp $((RPS_ENTRIES / RX_QUEUES)) 1024 65536)
+RPS_CPUS=$(cpumask_all "$CPU_COUNT")
+
+RP_FILTER=2
+[[ "$MULTIPATH" == "yes" ]] && RP_FILTER=0
+
+: > "$SYSCTL_OUT"
+{
+  printf '# Generated by bbr.sh %s on %s\n' "$VERSION" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  printf '# role=%s scene=%s target=%s business=%s\n\n' "$ROLE" "$SCENE" "$TARGET" "$BUSINESS"
+} >> "$SYSCTL_OUT"
+
+emit_sysctl net.core.default_qdisc fq
+if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+  emit_sysctl net.ipv4.tcp_congestion_control bbr
+else
+  printf '# skipped: bbr is not listed in net.ipv4.tcp_available_congestion_control\n' >> "$SYSCTL_OUT"
+fi
+emit_sysctl fs.file-max "$FS_FILE_MAX"
+emit_sysctl net.core.rmem_max "$TCP_MAX"
+emit_sysctl net.core.wmem_max "$TCP_MAX"
+emit_sysctl net.ipv4.tcp_rmem "$TCP_RMEM_MIN $TCP_RMEM_DEFAULT $TCP_MAX"
+emit_sysctl net.ipv4.tcp_wmem "$TCP_WMEM_MIN $TCP_WMEM_DEFAULT $TCP_MAX"
+emit_sysctl net.ipv4.tcp_moderate_rcvbuf 1
+emit_sysctl net.core.optmem_max "$OPTMEM"
+emit_sysctl net.ipv4.tcp_notsent_lowat "$LOWAT"
+emit_sysctl net.ipv4.tcp_slow_start_after_idle 0
+emit_sysctl net.ipv4.tcp_min_rtt_wlen "$MIN_RTT_WLEN"
+emit_sysctl net.ipv4.tcp_max_reordering "$REORDERING"
+emit_sysctl net.ipv4.tcp_ecn "$ECN"
+if [[ -n "$TFO_VALUE" ]]; then
+  emit_sysctl net.ipv4.tcp_fastopen "$TFO_VALUE"
+  [[ -n "$TFO_BLACKHOLE" ]] && emit_sysctl net.ipv4.tcp_fastopen_blackhole_timeout_sec "$TFO_BLACKHOLE"
+else
+  printf '# skipped: tcp_fastopen not useful for pure forwarding without local TCP termination\n' >> "$SYSCTL_OUT"
+fi
+emit_sysctl net.ipv4.tcp_mtu_probing 1
+emit_sysctl net.ipv4.tcp_rfc1337 1
+emit_sysctl net.ipv4.tcp_keepalive_time "$KEEP_TIME"
+emit_sysctl net.ipv4.tcp_keepalive_intvl "$KEEP_INTVL"
+emit_sysctl net.ipv4.tcp_keepalive_probes "$KEEP_PROBES"
+emit_sysctl net.ipv4.tcp_limit_output_bytes "$TCP_LIMIT"
+emit_sysctl net.core.somaxconn "$SOMAXCONN"
+emit_sysctl net.ipv4.tcp_max_syn_backlog "$SYN_BACKLOG"
+emit_sysctl net.ipv4.ip_local_port_range "1024 65535"
+emit_sysctl net.core.flow_limit_table_len "$FLOW_LIMIT"
+emit_sysctl net.ipv4.udp_rmem_min "$UDP_MIN"
+emit_sysctl net.ipv4.udp_wmem_min "$UDP_MIN"
+emit_sysctl net.ipv4.udp_mem "$UDP_LOW $UDP_PRESSURE $UDP_MAX_PAGES"
+emit_sysctl net.core.netdev_max_backlog "$NETDEV_BACKLOG"
+emit_sysctl net.core.netdev_budget "$NETDEV_BUDGET"
+emit_sysctl net.core.netdev_budget_usecs "$NETDEV_BUDGET_USECS"
+emit_sysctl net.core.rps_sock_flow_entries "$RPS_ENTRIES"
+
+if [[ "$ROLE" == "forwarding" || "$LANDING_ROUTES" == "yes" ]]; then
+  emit_sysctl net.ipv4.ip_forward 1
+  emit_sysctl net.ipv4.conf.all.rp_filter "$RP_FILTER"
+  emit_sysctl net.ipv4.conf.default.rp_filter "$RP_FILTER"
+  emit_sysctl net.ipv4.conf.all.accept_source_route 0
+  emit_sysctl net.ipv4.conf.default.accept_source_route 0
+  emit_sysctl net.ipv4.conf.all.send_redirects 0
+  emit_sysctl net.ipv4.conf.default.send_redirects 0
+  emit_sysctl net.ipv4.conf.all.accept_redirects 0
+  emit_sysctl net.ipv4.conf.default.accept_redirects 0
+  emit_sysctl net.ipv6.conf.all.forwarding 1
+  emit_sysctl net.ipv6.conf.default.forwarding 1
+  emit_sysctl net.ipv6.conf.all.accept_redirects 0
+  emit_sysctl net.ipv6.conf.default.accept_redirects 0
+  emit_sysctl net.ipv6.conf.all.accept_source_route 0
+  emit_sysctl net.ipv6.conf.default.accept_source_route 0
+  if [[ "$IPV6_RA" == "yes" ]]; then
+    printf '# IPv6 RA is needed on %s: set per-interface accept_ra=2 outside all/default if applicable.\n' "$DEFAULT_IFACE" >> "$SYSCTL_OUT"
+  fi
+fi
+
+if [[ "$CT_NEEDED" == "yes" ]]; then
+  emit_sysctl net.netfilter.nf_conntrack_max "$NF_CONNTRACK_MAX"
+  emit_sysctl net.netfilter.nf_conntrack_tcp_timeout_established "$CT_TCP_EST"
+  emit_sysctl net.netfilter.nf_conntrack_udp_timeout "$CT_UDP"
+  emit_sysctl net.netfilter.nf_conntrack_udp_timeout_stream "$CT_UDP_STREAM"
+fi
+
+if [[ -n "$BUSY_POLL" ]]; then
+  emit_sysctl net.core.busy_poll "$BUSY_POLL"
+  emit_sysctl net.core.busy_read "$BUSY_POLL"
+fi
+
+cat > "$LIMITS_OUT" <<EOF
+* soft nofile $NOFILE
+* hard nofile $NOFILE
+root soft nofile $NOFILE
+root hard nofile $NOFILE
+EOF
+
+cat > "$SYSTEMD_OUT" <<EOF
+[Manager]
+DefaultLimitNOFILE=$NOFILE
+EOF
+
+if [[ "$CT_NEEDED" == "yes" ]]; then
+  cat > "$MODPROBE_OUT" <<EOF
+options nf_conntrack hashsize=$NF_CONNTRACK_BUCKETS
+EOF
+fi
+
+cat > "$ROUTE_OUT" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+apply_init() {
+  local family="\$1" line clean
+  if [[ "\$family" == "4" ]]; then
+    ip route show default 2>/dev/null
+  else
+    ip -6 route show default 2>/dev/null
+  fi | while IFS= read -r line; do
+    [[ -z "\$line" ]] && continue
+    clean=\$(printf '%s' "\$line" | sed -E 's/ initcwnd [0-9]+//g; s/ initrwnd [0-9]+//g')
+    if [[ "\$family" == "4" ]]; then
+      ip route replace \$clean initcwnd $INITCWND initrwnd $INITCWND || true
+    else
+      ip -6 route replace \$clean initcwnd $INITCWND initrwnd $INITCWND || true
+    fi
+  done
+}
+apply_init 4
+apply_init 6
+EOF
+chmod +x "$ROUTE_OUT"
+
+cat > "$NIC_OUT" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+IFACE="${DEFAULT_IFACE}"
+TXQ="$TXQUEUELEN"
+RPS_ENABLE="$RPS_ENABLE"
+RPS_CPUS="$RPS_CPUS"
+RPS_FLOW_CNT="$RPS_FLOW_CNT"
+if [[ -d "/sys/class/net/\$IFACE" ]]; then
+  ip link set dev "\$IFACE" txqueuelen "\$TXQ" || true
+  if [[ "\$RPS_ENABLE" == "yes" ]]; then
+    for f in /sys/class/net/"\$IFACE"/queues/rx-*/rps_cpus; do
+      [[ -e "\$f" ]] && printf '%s' "\$RPS_CPUS" > "\$f" || true
+    done
+    for f in /sys/class/net/"\$IFACE"/queues/rx-*/rps_flow_cnt; do
+      [[ -e "\$f" ]] && printf '%s' "\$RPS_FLOW_CNT" > "\$f" || true
+    done
+  fi
+fi
+EOF
+chmod +x "$NIC_OUT"
+
+if [[ -n "$SERVICE_NAME" ]]; then
+  SERVICE_DROPIN="$OUT_DIR/${SERVICE_NAME}.override.conf"
+  cat > "$SERVICE_DROPIN" <<EOF
 [Service]
-Type=oneshot
-ExecStart=/usr/local/bin/enforce-rps.sh
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
+LimitNOFILE=$NOFILE
 EOF
-    systemctl daemon-reload
-    systemctl enable --now rps-optimize.service >/dev/null 2>&1
-    echo -e "  ${GREEN}[OK]${NC} RPS 已通过 systemd 写入开机自启 (rps-optimize.service)"
-
-    echo -e "  ${GREEN}${BOLD}CPU ${cc}核全部参与网络处理，火力全开！${NC}"
-    echo ""
-}
-
-apply_initcwnd() {
-    local icwnd=$(grep -oP 'initcwnd=\K[0-9]+' "$SYSCTL_CONF" 2>/dev/null || echo 30)
-    local iface=$(detect_interface)
-    [ -z "$iface" ] && return
-    local gw=$(ip route show default dev "$iface" 2>/dev/null | awk '/default/{print $3;exit}')
-    [ -z "$gw" ] && return
-    ip route change default via "$gw" dev "$iface" initcwnd "$icwnd" initrwnd "$icwnd" 2>/dev/null && \
-        echo -e "  ${GREEN}[OK]${NC} initcwnd=${icwnd} initrwnd=${icwnd} (秒开加速)" || \
-        echo -e "  ${YELLOW}[!]${NC} initcwnd设置失败(不影响使用)"
-}
-
-apply_sysctl_config() {
-    local role_name="$1" config="$2"
-    echo ""; echo -e "  ${BOLD}${CYAN}生成配置: $role_name${NC}"
-    if ! grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-        modprobe tcp_bbr 2>/dev/null
-        grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || \
-            echo -e "  ${RED}[!] 内核不支持BBR (需>=4.9, 当前$(uname -r))${NC}"
-    fi
-    check_memory_and_swap
-
-    mkdir -p /etc/modules-load.d
-    # 仅当生成的配置实际包含 conntrack 参数(转发/IX 等角色)时才加载 nf_conntrack,
-    # 纯应用层代理(前置/落地/通用)不强开, 避免无谓开销与 conntrack 表打满风险
-    if echo "$config" | grep -q nf_conntrack; then
-        modprobe nf_conntrack 2>/dev/null
-        echo -e "tcp_bbr\nnf_conntrack" > /etc/modules-load.d/network-optimize.conf
-    else
-        echo "tcp_bbr" > /etc/modules-load.d/network-optimize.conf
-    fi
-
-    if confirm_action "确认写入并应用?"; then
-        init_config_dir
-        mkdir -p /etc/security/limits.d
-        echo -e "* soft nofile 1048576\n* hard nofile 1048576\nroot soft nofile 1048576\nroot hard nofile 1048576" > /etc/security/limits.d/99-network-optimize.conf
-        sed -i '/DefaultLimitNOFILE/d' /etc/systemd/system.conf 2>/dev/null
-        echo "DefaultLimitNOFILE=1048576" >> /etc/systemd/system.conf
-        systemctl daemon-reload >/dev/null 2>&1
-        echo "$config" > "$SYSCTL_CONF"
-        echo "SYSCTL_PROFILE_NAME=\"$role_name\"" > "$PROFILE_CONF"
-        ln -sf "$SYSCTL_CONF" /etc/sysctl.d/99-network-optimize.conf
-        local err=$(sysctl --system 2>&1 | grep -i "error\|cannot\|invalid" || true)
-        [ -n "$err" ] && echo "$err" | head -3 | sed 's/^/    /'
-        apply_initcwnd
-        install_initcwnd_enforcer
-        echo -e "  ${GREEN}[OK]${NC} 已生效 | $(sysctl -n net.ipv4.tcp_congestion_control) + $(sysctl -n net.core.default_qdisc)"
-    else
-        echo -e "  ${DIM}已取消，未写入任何配置${NC}"
-        echo ""
-        return 1
-    fi
-    echo ""
-    apply_rps
-    return 0
-}
-
-install_gaming_role_runtime() {
-    local role_label="$1" txq="$2"
-    local iface
-    iface=$(detect_interface)
-    [ -z "$iface" ] && iface=""
-
-    cat > "$GAME_NET_SCRIPT" << EOF
-#!/bin/bash
-set -u
-
-ROLE="${role_label}"
-IFACE="${iface}"
-TXQLEN="${txq}"
-
-if [ -z "\$IFACE" ]; then
-    IFACE=\$(ip route show default 2>/dev/null | awk '/default/{print \$5;exit}')
 fi
 
-sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
-sysctl -w net.ipv6.conf.default.forwarding=1 >/dev/null 2>&1 || true
-sysctl -w net.ipv6.conf.all.accept_ra=2 >/dev/null 2>&1 || true
-sysctl -w net.ipv6.conf.default.accept_ra=2 >/dev/null 2>&1 || true
+cat > "$REPORT_OUT" <<EOF
+Network BBR Optimizer report
+============================
+role=$ROLE
+scene=$SCENE
+target=$TARGET
+business=$BUSINESS
+iface=$DEFAULT_IFACE
+up_mbps=$UP_MBPS
+down_mbps=$DOWN_MBPS
+up_rtt_ms=$UP_RTT
+down_rtt_ms=$DOWN_RTT
+loss_pct=$LOSS_PCT
+jitter_ms=$JITTER_MS
+queue_jitter_guard=$QUEUE_JITTER_GUARD
 
-if [ -n "\$IFACE" ] && [ -d "/sys/class/net/\$IFACE" ]; then
-    ip link set dev "\$IFACE" txqueuelen "\$TXQLEN" >/dev/null 2>&1 || true
-    tc qdisc replace dev "\$IFACE" root fq >/dev/null 2>&1 || true
-    sysctl -w "net.ipv6.conf.\$IFACE.accept_ra=2" >/dev/null 2>&1 || true
-fi
+tcp_conns=$TCP_CONNS
+udp_sessions=$UDP_SESSIONS
+cps=$CPS
+mem_pct=$MEM_PCT
+bdp_bytes=$BDP
+bdp_mult=$BDP_MULT
+tcp_max=$TCP_MAX
+tcp_limit_output_bytes=$TCP_LIMIT
+initcwnd=$INITCWND
+nofile=$NOFILE
+netdev_max_backlog=$NETDEV_BACKLOG
+txqueuelen=$TXQUEUELEN
+rps_enable=$RPS_ENABLE
+rps_cpus=$RPS_CPUS
+rps_flow_cnt=$RPS_FLOW_CNT
+tfo_value=${TFO_VALUE:-skipped}
+tfo_blackhole=${TFO_BLACKHOLE:-skipped}
+conntrack_needed=$CT_NEEDED
+nf_conntrack_max=$NF_CONNTRACK_MAX
+nf_conntrack_buckets=$NF_CONNTRACK_BUCKETS
+
+Application mux/multiplex: not enabled by this script.
 EOF
-    chmod +x "$GAME_NET_SCRIPT"
 
-    cat > "$GAME_NET_SERVICE" << EOF
+printf '\nGenerated files:\n'
+printf '  %s\n' "$SYSCTL_OUT" "$LIMITS_OUT" "$SYSTEMD_OUT" "$ROUTE_OUT" "$NIC_OUT" "$REPORT_OUT"
+[[ -f "$MODPROBE_OUT" ]] && printf '  %s\n' "$MODPROBE_OUT"
+[[ -n "${SERVICE_DROPIN:-}" ]] && printf '  %s\n' "$SERVICE_DROPIN"
+
+if [[ "$APPLY_MODE" == "no" ]]; then
+  log "Dry run complete. Review files in $OUT_DIR."
+  exit 0
+fi
+
+if ! is_root; then
+  warn "Not running as root. Generated files only; rerun with sudo to apply."
+  exit 0
+fi
+
+if [[ "$APPLY_MODE" == "ask" ]]; then
+  DO_APPLY=$(ask_yes_no "Apply generated configuration now?" "no")
+else
+  DO_APPLY=$(ask_yes_no "Apply generated configuration now?" "yes")
+fi
+if [[ "$DO_APPLY" != "yes" ]]; then
+  log "Not applied. Review files in $OUT_DIR."
+  exit 0
+fi
+
+BACKUP_DIR="/root/network-optimize-backup-$TS"
+mkdir -p "$BACKUP_DIR"
+write_rollback "$BACKUP_DIR"
+
+install_file "$SYSCTL_OUT" /etc/sysctl.d/99-network-optimize.conf 0644 "$BACKUP_DIR"
+install_file "$LIMITS_OUT" /etc/security/limits.d/99-network-optimize.conf 0644 "$BACKUP_DIR"
+install_file "$SYSTEMD_OUT" /etc/systemd/system.conf.d/99-network-optimize.conf 0644 "$BACKUP_DIR"
+if [[ "$CT_NEEDED" == "yes" ]]; then
+  install_file "$MODPROBE_OUT" /etc/modprobe.d/nf_conntrack.conf 0644 "$BACKUP_DIR"
+fi
+install_file "$ROUTE_OUT" /usr/local/sbin/network-optimize-route.sh 0755 "$BACKUP_DIR"
+install_file "$NIC_OUT" /usr/local/sbin/network-optimize-nic.sh 0755 "$BACKUP_DIR"
+
+cat > "$OUT_DIR/network-optimize-route.service" <<'EOF'
 [Unit]
-Description=Gaming UDP network runtime tuning (${role_label})
+Description=Apply network optimize route initcwnd
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=${GAME_NET_SCRIPT}
-RemainAfterExit=yes
+ExecStart=/usr/local/sbin/network-optimize-route.sh
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload >/dev/null 2>&1
-    if systemctl enable --now gaming-net-apply.service >/dev/null 2>&1; then
-        echo -e "  ${GREEN}[OK]${NC} 已应用 ${role_label} 运行时增强: txqueuelen=${txq}, fq qdisc, IPv6 RA保护 (保留网卡 offload)"
-    else
-        echo -e "  ${YELLOW}[!]${NC} gaming-net-apply.service 启用失败，可手动执行: ${GAME_NET_SCRIPT}"
-    fi
-}
-
-apply_temp_boost() {
-    echo -ne "  ${WHITE}预热:${NC}  ${DIM}临时拉满内核参数...${NC}"
-    modprobe tcp_bbr 2>/dev/null
-    ORIG_SYSCTL=$(sysctl -n net.core.default_qdisc net.ipv4.tcp_congestion_control net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default net.ipv4.tcp_window_scaling net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_no_metrics_save 2>/dev/null)
-    ORIG_TCP_RMEM=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)
-    ORIG_TCP_WMEM=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null)
-    sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr net.core.rmem_max=268435456 net.core.wmem_max=268435456 net.core.rmem_default=4194304 net.core.wmem_default=4194304 "net.ipv4.tcp_rmem=4096 4194304 268435456" "net.ipv4.tcp_wmem=4096 4194304 268435456" net.ipv4.tcp_window_scaling=1 net.ipv4.tcp_slow_start_after_idle=0 net.ipv4.tcp_no_metrics_save=1 >/dev/null 2>&1
-    local iface=$(detect_interface)
-    if [ -n "$iface" ]; then
-        local gw=$(ip route show default dev "$iface" 2>/dev/null | awk '/default/{print $3;exit}')
-        [ -n "$gw" ] && ip route change default via "$gw" dev "$iface" initcwnd 128 initrwnd 128 2>/dev/null
-    fi
-    echo -e "\r  ${WHITE}预热:${NC}  ${GREEN}[OK]${NC} BBR+256MB缓冲+initcwnd128        "
-}
-
-rollback_temp_boost() {
-    [ -z "$ORIG_SYSCTL" ] && return
-    local vals; IFS=$'\n' read -rd '' -a vals <<< "$ORIG_SYSCTL"
-    sysctl -w net.core.default_qdisc="${vals[0]}" net.ipv4.tcp_congestion_control="${vals[1]}" net.core.rmem_max="${vals[2]}" net.core.wmem_max="${vals[3]}" net.core.rmem_default="${vals[4]}" net.core.wmem_default="${vals[5]}" net.ipv4.tcp_window_scaling="${vals[6]}" net.ipv4.tcp_slow_start_after_idle="${vals[7]}" net.ipv4.tcp_no_metrics_save="${vals[8]}" >/dev/null 2>&1
-    [ -n "$ORIG_TCP_RMEM" ] && sysctl -w "net.ipv4.tcp_rmem=$ORIG_TCP_RMEM" >/dev/null 2>&1
-    [ -n "$ORIG_TCP_WMEM" ] && sysctl -w "net.ipv4.tcp_wmem=$ORIG_TCP_WMEM" >/dev/null 2>&1
-    echo -e "  ${DIM}已回滚临时参数${NC}"
-}
-
-speedtest_probe() {
-    local max_mbps=0 round=0 total=3
-    _test_url() {
-        local url="$1" label="$2" timeout="$3"
-        round=$(( round + 1 ))
-        echo -ne "\r  ${WHITE}带宽:${NC}  ${DIM}[${round}/${total}] ${label}...${NC}                                    " >&2
-        local speed=$(curl -so /dev/null -w '%{speed_download}' --connect-timeout 5 --max-time "$timeout" "$url" 2>/dev/null)
-        [ -z "$speed" ] && return
-        local mbps=$(awk "BEGIN{v=$speed*8/1000000; printf \"%.0f\",v}" 2>/dev/null)
-        [ -n "$mbps" ] && [ "$mbps" -gt "$max_mbps" ] 2>/dev/null && max_mbps=$mbps
-    }
-    _test_url "https://speed.cloudflare.com/__down?bytes=100000000" "Cloudflare 100MB" 30
-    _test_url "http://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" "Google CDN" 10
-    # 封顶 1GB, 避免高带宽机一次测速烧掉数 GB 流量
-    if [ "$max_mbps" -gt 500 ] 2>/dev/null; then
-        _test_url "https://speed.cloudflare.com/__down?bytes=1000000000" "Cloudflare 1GB" 15
-    else
-        _test_url "https://speed.cloudflare.com/__down?bytes=10000000" "Cloudflare 10MB" 15
-    fi
-    echo "$max_mbps"
-}
-
-auto_max_performance() {
-    echo ""; echo -e "  ${BOLD}${CYAN}[ 一键自动配置 ]${NC}"; echo ""
-    echo -e "  ${YELLOW}${BOLD}⚠️ 警告: 中转与落地高延迟请用【手动链路向导】，自动模式仅适合本地/直连建站！${NC}"
-    echo -e "  ${DIM}流程: 预热内核 -> 带宽测速 -> 延迟探测 -> 选择角色 -> 生成配置${NC}"; echo ""
-
-    local iface=$(detect_interface)
-    echo -e "  ${WHITE}网卡:${NC}  ${BOLD}${iface:-unknown}${NC}"
-
-    get_meminfo
-    echo -e "  ${WHITE}内存:${NC}  ${BOLD}$(( MEM_TOTAL_KB / 1024 ))MB${NC} + Swap ${BOLD}$(( SWAP_TOTAL_KB / 1024 ))MB${NC}"
-
-    apply_temp_boost
-
-    local best_rtt=200 rtt_ok=0
-    echo -ne "  ${WHITE}延迟:${NC}  探测中..."
-    for target in 8.8.8.8 1.1.1.1 142.250.80.46; do
-        local ms=$(ping -c 2 -W 3 -q "$target" 2>/dev/null | awk -F'/' '/rtt/{printf "%.0f",$5}')
-        if [ -n "$ms" ] && [ "$ms" -gt 0 ] 2>/dev/null; then
-            rtt_ok=1
-            [ "$ms" -lt "$best_rtt" ] && best_rtt=$ms
-        fi
-    done
-    if [ "$rtt_ok" -eq 0 ]; then
-        echo -e "\r  ${YELLOW}[!] 无法自动探测 RTT (可能禁 ICMP)${NC}                    "
-        echo -e "  ${DIM}自动估算会失真; 跨境中转/落地建议改用【手动链路向导】${NC}"
-        read_int "本机到主要对端(下一跳)的 RTT (ms, ping 显示的数字)" "50" "best_rtt"
-    else
-        [ "$best_rtt" -lt 20 ] && best_rtt=20
-        echo -e "\r  ${WHITE}延迟:${NC}  ${BOLD}RTT ${best_rtt}ms${NC}                    "
-    fi
-
-    echo -e "  ${DIM}测速会从 Cloudflare/Google 下载约 1~1.5GB 流量${NC}"
-    local bw=0
-    if confirm_action "跑带宽测速? (流量计费机可选否, 改为手动填写)"; then
-        echo -ne "  ${WHITE}带宽:${NC}  测速中..."
-        bw=$(speedtest_probe)
-    fi
-    if [ "$bw" -gt 0 ] 2>/dev/null; then
-        echo -e "\r  ${WHITE}带宽:${NC}  ${BOLD}${bw}Mbps${NC} (Cloudflare/Google实测)                  "
-    else
-        local link_speed=100
-        if [ -n "$iface" ]; then
-            if command -v ethtool >/dev/null 2>&1; then
-                local es=$(ethtool "$iface" 2>/dev/null | awk '/Speed:/{gsub(/[^0-9]/,"",$2);print $2}')
-                [ -n "$es" ] && [ "$es" -gt 0 ] 2>/dev/null && link_speed=$es
-            fi
-            if [ "$link_speed" = "1000" ] || [ "$link_speed" -le 0 ] 2>/dev/null; then
-                local sf="/sys/class/net/${iface}/speed"
-                [ -r "$sf" ] && { local sv=$(cat "$sf" 2>/dev/null); [ -n "$sv" ] && [ "$sv" -gt 0 ] 2>/dev/null && link_speed=$sv; }
-            fi
-        fi
-        bw=$(( link_speed / 10 ))
-        [ $bw -lt 10 ] && bw=10
-        echo -e "\r  ${WHITE}带宽:${NC}  ${BOLD}${bw}Mbps${NC} ${YELLOW}(测速失败,估算值)${NC}          "
-    fi
-
-    local bdp=$(( bw * best_rtt * 125 ))
-    echo -e "  ${WHITE}BDP:${NC}   ${BOLD}$(( bdp / 1024 ))KB${NC} (${bw}Mbps x ${best_rtt}ms)"
-    echo ""
-
-    echo -e "  ${DIM}[ 带宽确认 ]${NC}"
-    echo -e "  ${DIM}实测: ${bw}Mbps | 如果你想用商家宣称值/自己填，可以修改${NC}"
-    if confirm_action "实测 ${bw}Mbps，接受此值?"; then
-        :
-    else
-        echo ""
-        local manual_bw=""
-        while [ -z "$manual_bw" ]; do
-            echo -ne "  ${WHITE}手动输入带宽 (Mbps) [推荐 300]: ${NC}"
-            read manual_bw
-            [[ "$manual_bw" =~ ^[0-9]+$ ]] && [ "$manual_bw" -gt 0 ] && { bw=$manual_bw; break; }
-            echo -e "  ${RED}请输入正整数${NC}"
-            manual_bw=""
-        done
-        bdp=$(( bw * best_rtt * 125 ))
-        echo -e "  ${YELLOW}-> 使用手动值: ${bw}Mbps x ${best_rtt}ms = $(( bdp / 1024 ))KB BDP${NC}"
-    fi
-    echo ""
-
-    if ! confirm_action "使用此结果生成配置?"; then
-        echo -e "  ${DIM}已取消${NC}"
-        rollback_temp_boost
-        return
-    fi
-
-    echo ""
-    echo -e "  ${DIM}用户 -> 1.前置 -> 2.IX -> 3.转发 -> 4.落地 -> 目标${NC}"; echo ""
-    select_menu "本机角色" "1. 前置服务器 (用户直连入口)" "2. IX专线服务器 (上下游中转)" "3. 转发/线路服务器 (国际线路)" "4. 落地服务器 (出口访问目标)" "5. 通用 (不区分角色)"
-    local role_idx=$?
-    local role_name role_label
-    case $role_idx in
-        0) role_name="前置"; role_label="前置服务器 (用户直连入口)";;
-        1) role_name="IX专线"; role_label="IX专线服务器 (上下游中转)";;
-        2) role_name="转发"; role_label="转发/线路服务器 (国际线路)";;
-        3) role_name="落地"; role_label="落地服务器 (出口访问目标)";;
-        *) role_name="通用"; role_label="通用极速模式";;
-    esac
-
-    local up_rtt_eff=$best_rtt down_rtt_eff=$best_rtt
-
-    local bdp_eff_up=$(( bw * up_rtt_eff * 125 ))
-    local bdp_eff_dn=$(( bw * down_rtt_eff * 125 ))
-    local bdp_eff=$bdp_eff_up; [ $bdp_eff_dn -gt $bdp_eff ] && bdp_eff=$bdp_eff_dn
-
-    local h="# 角色: ${role_label} (自动检测)
-# 网卡: ${iface:-unknown} | 实测带宽: ${bw}Mbps
-# 内存: $(( MEM_TOTAL_KB / 1024 ))MB + Swap $(( SWAP_TOTAL_KB / 1024 ))MB
-# 探测 RTT: ${best_rtt}ms
-# 有效 BDP: $(( bdp_eff / 1024 ))KB"
-
-    local cfg
-    cfg="$(calculate_and_generate "${role_name} (${bw}Mx${best_rtt}ms)" "$bw" "$up_rtt_eff" "$bw" "$down_rtt_eff" "$h")"
-    case $role_idx in
-        1) cfg="${cfg}$(role_ix_sysctl_overrides)" ;;
-        2) cfg="${cfg}$(role_relay_small_sysctl_overrides)" ;;
-    esac
-
-    if apply_sysctl_config "${role_name} (${bw}Mx${best_rtt}ms)" "$cfg"; then
-        case $role_idx in
-            1) install_gaming_role_runtime "IX专线/高并发UDP中转" "2000" ;;
-            2) install_gaming_role_runtime "转发线路/AWS小内存保守" "1000" ;;
-        esac
-    fi
-}
-
-# ==================== 链路向导 ====================
-wizard_main() {
-    echo ""
-    echo -e "  ${BOLD}${CYAN}手动链路向导${NC}"
-    echo -e "  ${DIM}链路结构: 用户 -> 前置 -> IX -> 转发 -> 落地 -> 目标${NC}"
-    echo ""
-    select_menu "请选择本机角色" \
-        "1. 前置服务器 (用户直连入口)" \
-        "2. IX 专线服务器 (上下游中转)" \
-        "3. 转发 / 线路服务器 (国际线路)" \
-        "4. 落地服务器 (出口访问目标)" \
-        "返回主菜单"
-    case $? in
-        0) wizard_frontend;;
-        1) wizard_ix;;
-        2) wizard_relay;;
-        3) wizard_landing;;
-    esac
-}
-
-wizard_frontend() {
-    echo ""; echo -e "  ${BOLD}${CYAN}[ 1. 前置服务器 ]${NC}"; echo ""
-    echo -e "  ${DIM}只需本机带宽 + 用户/下游 RTT (对端带宽不影响 BDP)${NC}"
-    local mb rtt; read_int "本机带宽 (Mbps)" "" "mb"
-    read_rtt_via_tcp "用户到本机" "rtt" ""
-    echo ""; echo -e "  ${WHITE}${BOLD}下游线路 (RTT 决定 BDP，带宽只看本机)${NC}"
-    collect_lines "下游" "IX专线/HK线路/SG直连" "$mb" ""
-    local up_rtt=$rtt dn_rtt=$CL_MAIN_RTT
-    [ $CL_MAIN_RTT -lt $rtt ] && dn_rtt=$rtt
-    local h="# 角色: 前置服务器
-# 本机 ${mb}Mbps | 用户 RTT ${rtt}ms (TCP实测)
-# 下游 ${CL_COUNT} 条${CL_HEADER}"
-    apply_sysctl_config "前置 (${mb}Mbps)" "$(calculate_and_generate "前置 (${mb}Mbps)" "$mb" "$rtt" "$mb" "$CL_MAIN_RTT" "$h")"
-}
-
-wizard_ix() {
-    echo ""; echo -e "  ${BOLD}${CYAN}[ 2. IX专线 ]${NC}"; echo ""
-    echo -e "  ${DIM}IX 透传节点：上下游各填一条最长 RTT 的线路即可${NC}"
-    local mb; read_int "本机带宽 (Mbps)" "" "mb"
-    echo ""; echo -e "  ${WHITE}${BOLD}上游线路${NC}"
-    collect_lines "上游" "前置/中国接入" "$mb" "6"
-    local un=$CL_COUNT uh="$CL_HEADER" up_rtt=$CL_MAIN_RTT
-    echo ""; echo -e "  ${WHITE}${BOLD}下游线路${NC}"
-    collect_lines "下游" "落地/HK转发" "$mb" ""
-    local dn_rtt=$CL_MAIN_RTT
-    local h="# 角色: IX专线 | 本机 ${mb}Mbps
-# 上游 ${un} 条${uh}
-# 下游 ${CL_COUNT} 条${CL_HEADER}"
-    local cfg
-    cfg="$(calculate_and_generate "IX (${mb}Mbps)" "$mb" "$up_rtt" "$mb" "$dn_rtt" "$h")$(role_ix_sysctl_overrides)"
-    if apply_sysctl_config "IX (${mb}Mbps)" "$cfg"; then
-        install_gaming_role_runtime "IX专线/高并发UDP中转" "2000"
-    fi
-}
-
-wizard_relay() {
-    echo ""; echo -e "  ${BOLD}${CYAN}[ 3. 转发/线路服务器 ]${NC}"; echo ""
-    echo -e "  ${DIM}下游可填多个目的地（如日本+美国），脚本自动按 RTT 最长者算 BDP${NC}"
-    local mb; read_int "本机带宽 (Mbps)" "" "mb"
-
-    echo ""; echo -e "  ${WHITE}${BOLD}上游来源 (IX/前置 -> 本机)${NC}"
-    local ur=0 ur_count=0 ur_log=""
-    while true; do
-        ur_count=$(( ur_count + 1 ))
-        local cur_ur
-        read_rtt_via_tcp "上游 #${ur_count}" "cur_ur" ""
-        ur_log="${ur_log}
-# 上游 #${ur_count}: RTT ${cur_ur}ms"
-        [ $cur_ur -gt $ur ] && ur=$cur_ur
-        echo ""; confirm_action "还有更多上游来源?" || break
-    done
-
-    echo ""; echo -e "  ${WHITE}${BOLD}下游目的地 (本机 -> 落地)${NC}"
-    echo -e "  ${DIM}填 ping 命令显示的延迟数字 (RTT，无需换算)${NC}"
-    echo -e "  ${DIM}典型 RTT: 国内同城 5ms / 香港 30ms / 日本 50ms / 美西 150ms / 欧洲 280ms${NC}"
-    local dr=0 dr_count=0 dr_log=""
-    while true; do
-        dr_count=$(( dr_count + 1 ))
-        local cur_dr
-        read_rtt_via_tcp "下游 #${dr_count}" "cur_dr" ""
-        dr_log="${dr_log}
-# 下游 #${dr_count}: RTT ${cur_dr}ms"
-        [ $cur_dr -gt $dr ] && dr=$cur_dr
-        echo ""; confirm_action "还有更多下游目的地?" || break
-    done
-
-    echo ""
-    echo -e "  ${DIM}-> 上游主导 RTT: ${ur}ms | 下游主导 RTT: ${dr}ms (取最大值算 BDP)${NC}"
-
-    local h="# 角色: 转发/线路服务器 | 本机 ${mb}Mbps
-# 上游 ${ur_count} 条${ur_log}
-# 下游 ${dr_count} 条${dr_log}
-# BDP 主导: 上 ${ur}ms / 下 ${dr}ms (取最长 RTT)"
-    local cfg
-    cfg="$(calculate_and_generate "转发 (${mb}Mbps)" "$mb" "$ur" "$mb" "$dr" "$h")$(role_relay_small_sysctl_overrides)"
-    if apply_sysctl_config "转发 (${mb}Mbps)" "$cfg"; then
-        install_gaming_role_runtime "转发线路/AWS小内存保守" "1000"
-    fi
-}
-
-wizard_landing() {
-    echo ""; echo -e "  ${BOLD}${CYAN}[ 4. 落地服务器 ]${NC}"; echo ""
-    echo -e "  ${DIM}落地节点出口=本机网卡，同IDC RTT<5ms，只需上游线路即可${NC}"
-    local mb; read_int "本机带宽 (Mbps)" "" "mb"
-    echo ""; echo -e "  ${WHITE}${BOLD}上游线路 (跨国主导 BDP)${NC}"
-    collect_lines "上游" "IX直连/转发/HK线路" "$mb" ""
-    local h="# 角色: 落地服务器 | 本机 ${mb}Mbps
-# 上游 ${CL_COUNT} 条${CL_HEADER}
-# 出口: 同IDC RTT<5ms (默认)"
-    apply_sysctl_config "落地 (${mb}Mbps)" "$(calculate_and_generate "落地 (${mb}Mbps)" "$mb" "$CL_MAIN_RTT" "$mb" "5" "$h")"
-}
-
-# ==================== 状态 ====================
-show_status() {
-    echo ""; echo -e "  ${BOLD}${CYAN}========== 系统状态 ==========${NC}"
-    detect_bbr_version
-    [ -f "$PROFILE_CONF" ] && { source "$PROFILE_CONF"; echo -e "  ${GREEN}[ON]${NC} BBR: ${WHITE}$SYSCTL_PROFILE_NAME${NC}"; } || echo -e "  ${DIM}[--] BBR: 未配置${NC}"
-    echo -e "  内核 BBR 版本: ${BOLD}${BBR_VER_LABEL}${NC} (脚本自动适配)"
-    echo -e "  拥塞: ${BOLD}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${NC} | 队列: ${BOLD}$(sysctl -n net.core.default_qdisc 2>/dev/null)${NC}"
-    echo -e "  rmem_max: ${BOLD}$(( $(sysctl -n net.core.rmem_max 2>/dev/null) / 1048576 ))MB${NC} | lowat: ${BOLD}$(( $(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null) / 1024 ))KB${NC}"
-    local icwnd=$(ip route show default 2>/dev/null | grep -oP 'initcwnd \K[0-9]+' || echo "-")
-    echo -e "  initcwnd: ${BOLD}${icwnd}${NC} | ECN: ${BOLD}$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null)${NC} | TFO: ${BOLD}$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)${NC}"
-    get_meminfo; echo -e "  内存: ${BOLD}$(( MEM_TOTAL_KB / 1024 ))MB${NC} | Swap: ${BOLD}$(( SWAP_TOTAL_KB / 1024 ))MB${NC}"
-    local ct=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null) cm=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
-    [ -n "$ct" ] && echo -e "  conntrack: ${BOLD}${ct}/${cm}${NC}"
-    local enf=$(systemctl is-active initcwnd-enforcer.timer 2>/dev/null || echo "inactive")
-    echo -e "  守护: ${BOLD}${enf}${NC}"
-    local game_net=$(systemctl is-active gaming-net-apply.service 2>/dev/null || echo "inactive")
-    echo -e "  游戏UDP增强: ${BOLD}${game_net}${NC}"
-    local _o=$(awk '/^Tcp:/{o=$12} END{print o}' /proc/net/snmp 2>/dev/null)
-    local _r=$(awk '/^Tcp:/{r=$13} END{print r}' /proc/net/snmp 2>/dev/null)
-    if [ -n "$_o" ] && [ "$_o" -gt 0 ] 2>/dev/null; then
-        local _rate=$(awk "BEGIN{printf \"%.2f\", $_r*100/$_o}")
-        echo -e "  重传率: ${BOLD}${_rate}%${NC} ${DIM}(累计 RetransSegs ${_r} / OutSegs ${_o})${NC}"
-    fi
-    echo ""
-}
-
-# ==================== initcwnd 守护进程 ====================
-install_initcwnd_enforcer() {
-    cat > /usr/local/bin/enforce-initcwnd.sh << 'EOF'
-#!/bin/bash
-CONF="/etc/network-optimizer/sysctl-optimize.conf"
-[ ! -f "$CONF" ] && exit 0
-ICWND=$(grep -oP 'initcwnd=\K[0-9]+' "$CONF" || echo 30)
-IFACE=$(ip route show default 2>/dev/null | awk '/default/{print $5;exit}')
-[ -z "$IFACE" ] && exit 0
-GW=$(ip route show default dev "$IFACE" 2>/dev/null | awk '/default/{print $3;exit}')
-[ -z "$GW" ] && exit 0
-if ! ip route show default | grep -q "initcwnd $ICWND"; then
-    ip route change default via "$GW" dev "$IFACE" initcwnd "$ICWND" initrwnd "$ICWND" >/dev/null 2>&1
-fi
-EOF
-    chmod +x /usr/local/bin/enforce-initcwnd.sh
-    cat > /etc/systemd/system/initcwnd-enforcer.service << 'EOF'
+cat > "$OUT_DIR/network-optimize-nic.service" <<'EOF'
 [Unit]
-Description=Enforce initcwnd settings
+Description=Apply network optimize NIC txqueuelen and RPS
 After=network-online.target
+Wants=network-online.target
+
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/enforce-initcwnd.sh
-EOF
-    cat > /etc/systemd/system/initcwnd-enforcer.timer << 'EOF'
-[Unit]
-Description=Run initcwnd enforcer every minute
-[Timer]
-OnBootSec=30sec
-OnUnitActiveSec=1min
-AccuracySec=1sec
+ExecStart=/usr/local/sbin/network-optimize-nic.sh
+
 [Install]
-WantedBy=timers.target
+WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now initcwnd-enforcer.timer >/dev/null 2>&1
-    echo -e "  ${GREEN}[OK]${NC} initcwnd 守护已启动（每分钟检查，网络断开后自动恢复秒开）"
-}
+install_file "$OUT_DIR/network-optimize-route.service" /etc/systemd/system/network-optimize-route.service 0644 "$BACKUP_DIR"
+install_file "$OUT_DIR/network-optimize-nic.service" /etc/systemd/system/network-optimize-nic.service 0644 "$BACKUP_DIR"
 
-reload_network() {
-    echo ""; echo -e "  ${BOLD}${CYAN}刷新网络配置${NC}"; echo ""
-    local MATCH='tcp_congestion_control|tcp_rmem|tcp_wmem|rmem_max|wmem_max|default_qdisc|tcp_notsent_lowat|busy_poll|busy_read|optmem_max|tcp_fastopen|tcp_tw_reuse|ip_forward|udp_rmem_min|udp_wmem_min|udp_mem|nf_conntrack_max'
-    local found=0 files=""
-    for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
-        [ ! -f "$f" ] || [ "$f" = "/etc/sysctl.d/99-network-optimize.conf" ] && continue
-        grep -qE "$MATCH" "$f" 2>/dev/null && { echo -e "  ${YELLOW}[!]${NC} $f"; found=1; files="$files $f"; }
-    done
-    if [ $found -eq 1 ] && confirm_action "删除冲突文件? (备份到 $CONFIG_DIR/backup/)"; then
-        mkdir -p "$CONFIG_DIR/backup"
-        for f in $files; do cp "$f" "$CONFIG_DIR/backup/$(echo "$f"|tr / _).bak" 2>/dev/null; rm -f "$f"; echo -e "  ${GREEN}[OK]${NC} 删除: $f"; done
-    fi
-    echo ""
-    # 只加载我们自己的配置文件，避免刷屏所有系统/云镜像默认（仍有效，因 99-* 已是覆盖优先级）
-    [ -f "$SYSCTL_CONF" ] && run_cmd "sysctl 重载（仅本脚本配置）" sysctl -p "$SYSCTL_CONF" || echo -e "  ${DIM}无配置${NC}"
-    [ -f "$SYSCTL_CONF" ] && apply_initcwnd
-    install_initcwnd_enforcer
-    systemctl is-enabled gaming-net-apply.service >/dev/null 2>&1 && run_cmd "游戏UDP运行时增强" systemctl restart gaming-net-apply.service
-    echo -e "  ${GREEN}${BOLD}完成${NC} | $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) rmem$(( $(sysctl -n net.core.rmem_max 2>/dev/null) / 1048576 ))MB"; echo ""
-}
+if [[ -n "${SERVICE_DROPIN:-}" ]]; then
+  install_file "$SERVICE_DROPIN" "/etc/systemd/system/${SERVICE_NAME}.d/override.conf" 0644 "$BACKUP_DIR"
+fi
 
-# ==================== 端口监控 ====================
-port_monitor() {
-    while true; do
-        echo ""
-        echo -e "  ${BOLD}${CYAN}端口连接监控${NC}"; echo ""
-        select_menu "请选择" \
-            "查看所有监听端口的连接数" \
-            "查看指定端口的来源 IP" \
-            "查看 TOP 20 连接数 IP 排行" \
-            "返回主菜单"
-        case $? in
-            0) port_all;;
-            1) port_single;;
-            2) port_rank;;
-            3) return;;
-        esac
-        echo -ne "  ${DIM}回车继续...${NC}"; read -r
-    done
-}
+sysctl --system
+systemctl daemon-reexec 2>/dev/null || true
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable --now network-optimize-route.service 2>/dev/null || true
+systemctl enable --now network-optimize-nic.service 2>/dev/null || true
 
-_svc() { case "$1" in 22) echo SSH;; 80) echo HTTP;; 443) echo HTTPS;; 8080) echo HTTP-Alt;; 3306) echo MySQL;; 5432) echo PG;; 6379) echo Redis;; 53) echo DNS;; 1080) echo SOCKS;; 8388) echo SS;; *) echo "-";; esac; }
-
-port_all() {
-    echo ""; echo -e "  ${BOLD}${CYAN}[ 端口连接 ]${NC}"; echo ""
-    printf "  ${BOLD}%-8s %-12s %-8s %-8s${NC}\n" "端口" "服务" "连接" "IP数"
-    ss -tlnH 2>/dev/null|awk '{print $4}'|grep -oP '(?<=:)\d+$'|sort -un|while read p; do
-        local c=$(ss -tnH 2>/dev/null|awk '{print $5}'|grep -c ":${p}$")
-        local u=$(ss -tnH 2>/dev/null|awk '{print $5}'|grep ":${p}$"|awk -F: '{print $1}'|sort -u|grep -cv '^$')
-        printf "  %-8s %-12s %-8s %-8s\n" "$p" "$(_svc $p)" "$c" "$u"
-    done; echo ""
-}
-port_single() { echo ""; rst; local p; read_int "端口" "" "p"; echo -e "  ${BOLD}${CYAN}端口 $p ($(_svc $p))${NC}"; echo ""
-    ss -tnH 2>/dev/null|awk '{print $5}'|grep ":${p}$"|grep -oP '^[^:]+'|sort|uniq -c|sort -rn|awk '{printf "  %-8s %s\n",$1,$2}'; echo ""; }
-port_rank() { echo ""; echo -e "  ${BOLD}${CYAN}[ 排行 ]${NC}"; echo -e "  ${WHITE}${BOLD}TOP 20 IP${NC}"; echo ""
-    ss -tnH 2>/dev/null|awk '{print $5}'|grep -oP '^[^:]+'|sort|uniq -c|sort -rn|head -20|awk '{printf "  %-8s %s\n",$1,$2}'
-    echo ""; echo -e "  ${WHITE}${BOLD}状态分布${NC}"; echo ""
-    ss -tnH 2>/dev/null|awk '{print $1}'|sort|uniq -c|sort -rn|awk '{printf "  %-15s %s\n",$2,$1}'; echo ""; }
-
-# ==================== 链路诊断 ====================
-link_diagnose() {
-    echo ""; echo -e "  ${BOLD}${CYAN}链路诊断 (BBR / 丢包 / 重传)${NC}"; echo ""
-    detect_bbr_version
-    local cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    local qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-    echo -e "  拥塞算法: ${BOLD}${cc}${NC} | 队列: ${BOLD}${qd}${NC} | 内核 BBR: ${BOLD}${BBR_VER_LABEL}${NC}"
-    [ "$cc" = "bbr" ] && echo -e "  ${GREEN}[OK]${NC} BBR 已启用" || echo -e "  ${YELLOW}[!]${NC} 当前拥塞算法不是 bbr"
-    echo ""
-    rst; local ip
-    echo -ne "  ${WHITE}输入对端 IP/域名 (留空看本机连接概况): ${NC}"; read -r ip
-
-    if [ -z "$ip" ]; then
-        echo ""; echo -e "  ${WHITE}${BOLD}TCP 连接状态分布${NC}"; echo ""
-        ss -tnH 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -rn | awk '{printf "  %-14s %s\n",$2,$1}'
-        local la=$(ss -tnH state last-ack 2>/dev/null | grep -c .)
-        local cw=$(ss -tnH state close-wait 2>/dev/null | grep -c .)
-        echo ""
-        if [ "${la:-0}" -gt 50 ] 2>/dev/null || [ "${cw:-0}" -gt 50 ] 2>/dev/null; then
-            echo -e "  ${YELLOW}[!] LAST-ACK=${la} CLOSE-WAIT=${cw} 偏多${NC}"
-            echo -e "  ${DIM}多为对端/链路在挥手阶段丢包, 或对端批量断连; 填某对端 IP 再测它的 retrans/rtt${NC}"
-        else
-            echo -e "  ${GREEN}[OK]${NC} 无明显僵尸连接堆积 (LAST-ACK=${la} CLOSE-WAIT=${cw})"
-        fi
-        echo ""; return
-    fi
-
-    echo ""
-    local n=$(ss -tnH "dst $ip" 2>/dev/null | grep -c .)
-    echo -e "  ${WHITE}${BOLD}到 ${ip} 的 TCP 连接: ${n} 条${NC} ${DIM}(下方 ss -ti 看 bbr/rtt/cwnd/retrans)${NC}"; echo ""
-    ss -tinp "dst $ip" 2>/dev/null | head -16 | sed 's/^/  /'
-    echo ""
-    echo -e "  ${WHITE}${BOLD}丢包/延迟 (ping x20)${NC}"; echo ""
-    local pres=$(ping -c 20 -i 0.2 -W 2 "$ip" 2>/dev/null)
-    if [ -n "$pres" ]; then
-        echo "$pres" | grep -E 'packet loss|rtt |round-trip' | sed 's/^/  /'
-    else
-        echo -e "  ${DIM}ping 无响应 (对端可能禁 ICMP)${NC}"
-    fi
-    echo ""
-    if command -v mtr >/dev/null 2>&1; then
-        echo -e "  ${WHITE}${BOLD}逐跳丢包 (mtr)${NC}"; echo ""
-        mtr -rwzbc 30 "$ip" 2>/dev/null | sed 's/^/  /'
-    else
-        echo -e "  ${DIM}未装 mtr, 逐跳定位可装: apt install -y mtr-tiny  或  yum install -y mtr${NC}"
-    fi
-    echo ""
-}
-
-# ==================== 卸载 / 还原 ====================
-uninstall_all() {
-    echo ""; echo -e "  ${BOLD}${YELLOW}卸载 / 还原${NC}"; echo ""
-    echo -e "  ${DIM}移除本脚本写入的全部 sysctl 配置与 systemd 单元, 并重载系统默认${NC}"
-    confirm_action "确认卸载?" || { echo -e "  ${DIM}已取消${NC}"; return; }
-
-    for u in initcwnd-enforcer.timer initcwnd-enforcer.service rps-optimize.service gaming-net-apply.service; do
-        systemctl disable --now "$u" >/dev/null 2>&1
-        rm -f "/etc/systemd/system/$u"
-    done
-    rm -f /usr/local/bin/enforce-initcwnd.sh /usr/local/bin/enforce-rps.sh "$GAME_NET_SCRIPT"
-
-    rm -f /etc/sysctl.d/99-network-optimize.conf
-    rm -f /etc/modules-load.d/network-optimize.conf
-    rm -f /etc/security/limits.d/99-network-optimize.conf
-    sed -i '/^DefaultLimitNOFILE=1048576/d' /etc/systemd/system.conf 2>/dev/null
-
-    rm -f "$SYSCTL_CONF" "$PROFILE_CONF"
-
-    systemctl daemon-reload >/dev/null 2>&1
-    sysctl --system >/dev/null 2>&1
-
-    echo -e "  ${GREEN}[OK]${NC} 已移除配置/单元并重载系统默认 sysctl"
-    echo -e "  ${DIM}注: 默认路由 initcwnd 需重启或手动 ip route 复位; /etc/fstab 里的 swap 未删除${NC}"
-    echo ""
-}
-
-# ==================== 主菜单 ====================
-interactive_main() {
-    while true; do
-        clear; echo ""
-        echo -e "  ${BOLD}${WHITE}专线网络优化工具 $VERSION${NC}"
-        echo -e "  ${DIM}=========================${NC}"
-        echo ""
-        detect_bbr_version
-        [ -f "$PROFILE_CONF" ] && { source "$PROFILE_CONF"; echo -e "  ${GREEN}[ON]${NC} BBR优化:  ${WHITE}$SYSCTL_PROFILE_NAME${NC}  ${DIM}[内核 ${BBR_VER_LABEL}]${NC}"; } || echo -e "  ${DIM}[--] BBR优化:  未配置  [内核 ${BBR_VER_LABEL}]${NC}"
-        get_meminfo
-        echo -e "  ${DIM}     系统内存:  $(( MEM_TOTAL_KB/1024 ))M  Swap $(( SWAP_TOTAL_KB/1024 ))M${NC}"
-        echo ""
-        select_menu "请选择操作" \
-            "手动链路向导" \
-            "一键自动配置 (中转与落地高延迟请用手动链路)" \
-            "查看系统状态" \
-            "查看端口连接" \
-            "链路诊断 (BBR/丢包/重传)" \
-            "刷新当前配置" \
-            "卸载 / 还原" \
-            "退出"
-        case $? in
-            0)  wizard_main ;;
-            1)  auto_max_performance ;;
-            2)  show_status ;;
-            3)  port_monitor; continue ;;
-            4)  link_diagnose ;;
-            5)  reload_network ;;
-            6)  uninstall_all ;;
-            7)  rst; exit 0 ;;
-        esac
-        echo ""
-        echo -ne "  ${DIM}回车返回主菜单...${NC}"; read -r
-    done
-}
-
-# ==================== 入口 ====================
-case "${1}" in
-    status) show_status;;
-    auto) auto_max_performance;;
-    wizard) wizard_main;;
-    diag) link_diagnose;;
-    uninstall) uninstall_all;;
-    ports) port_all;; ports-rank) port_rank;; "") interactive_main;;
-    *) echo "$VERSION | $0 [auto|wizard|status|ports|diag|uninstall]"; exit 1;;
-esac
+printf '\nApplied. Rollback script: %s/rollback.sh\n' "$OUT_DIR"
+printf 'Backup directory: %s\n' "$BACKUP_DIR"
+printf 'A reboot is recommended if nf_conntrack hashsize was changed.\n'
